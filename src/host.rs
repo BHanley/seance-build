@@ -664,12 +664,12 @@ mod tests {
     #[test]
     fn menu_items_come_back_in_host_order_with_groups() {
         let out = r#"{"schema":1,"items":[
-          {"id":"mtg:2026-08-06/l10","label":"L10","detail":"9:00a","group":"thu"},
+          {"id":"mtg:2026-08-06/standup","label":"Standup","detail":"9:00a","group":"thu"},
           {"id":"mtg:2026-08-06/1-1","label":"1:1","group":"thu"}
         ]}"#;
         let items = parse_menu_items(out).unwrap();
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].id, "mtg:2026-08-06/l10");
+        assert_eq!(items[0].id, "mtg:2026-08-06/standup");
         assert_eq!(items[0].group, "thu");
         assert_eq!(items[1].label, "1:1");
     }

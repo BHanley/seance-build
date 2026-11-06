@@ -516,12 +516,12 @@ mod tests {
             80,
             &[
                 "see https://github.com/o/r/pull/6807 for the CI run",
-                "plat https://cadence.ham.xyz/plats/86ff368c-92db for the numbers",
+                "plat https://reports.example.com/plats/86ff368c-92db for the numbers",
             ],
         );
         assert_eq!(
             url_at_cell(&snap, 1, 10).as_deref(),
-            Some("https://cadence.ham.xyz/plats/86ff368c-92db")
+            Some("https://reports.example.com/plats/86ff368c-92db")
         );
         assert_eq!(
             url_at_cell(&snap, 0, 10).as_deref(),
@@ -533,7 +533,7 @@ mod tests {
     /// arbitrary from elsewhere on screen.
     #[test]
     fn a_click_on_plain_text_opens_nothing() {
-        let snap = grid_of(80, &["plat https://cadence.ham.xyz/x for the numbers"]);
+        let snap = grid_of(80, &["plat https://reports.example.com/x for the numbers"]);
         assert_eq!(url_at_cell(&snap, 0, 0), None);
         assert_eq!(url_at_cell(&snap, 0, 40), None);
     }
@@ -541,7 +541,7 @@ mod tests {
     /// An OSC-8 span wins over bare text, but only on the cells it covers.
     #[test]
     fn an_osc8_span_only_claims_its_own_cells() {
-        let mut snap = grid_of(80, &["#6807 and https://cadence.ham.xyz/plats/abc"]);
+        let mut snap = grid_of(80, &["#6807 and https://reports.example.com/plats/abc"]);
         snap.hyperlinks.push(HyperlinkSpan {
             row: 0,
             col_start: 0,
@@ -554,7 +554,7 @@ mod tests {
         );
         assert_eq!(
             url_at_cell(&snap, 0, 20).as_deref(),
-            Some("https://cadence.ham.xyz/plats/abc")
+            Some("https://reports.example.com/plats/abc")
         );
     }
 
@@ -562,10 +562,10 @@ mod tests {
     /// would otherwise slide the hit box.
     #[test]
     fn a_non_ascii_glyph_does_not_shift_the_hit_box() {
-        let snap = grid_of(80, &["✦ ✦ https://cadence.ham.xyz/plats/abc"]);
+        let snap = grid_of(80, &["✦ ✦ https://reports.example.com/plats/abc"]);
         assert_eq!(
             url_at_cell(&snap, 0, 4).as_deref(),
-            Some("https://cadence.ham.xyz/plats/abc")
+            Some("https://reports.example.com/plats/abc")
         );
         assert_eq!(url_at_cell(&snap, 0, 3), None);
     }
@@ -608,11 +608,11 @@ mod tests {
         let snap = grid_of(
             50,
             &[
-                "  v2 is live at https://vita-reports.ham.xyz",
+                "  v2 is live at https://reports.example.com",
                 "  /s/675a4e6f8887. There are no more",
             ],
         );
-        let want = Some("https://vita-reports.ham.xyz/s/675a4e6f8887");
+        let want = Some("https://reports.example.com/s/675a4e6f8887");
         assert_eq!(url_at_cell(&snap, 0, 20).as_deref(), want);
         assert_eq!(url_at_cell(&snap, 1, 4).as_deref(), want);
 

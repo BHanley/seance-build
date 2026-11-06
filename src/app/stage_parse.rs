@@ -794,7 +794,7 @@ The circle lead's running log, newest first. Doing / Done / Next / Waiting on.\n
     fn health_report_handles_a_sleeping_mac_and_problems() {
         let text = "# Seance health 2026-10-19 12:00: 2 warnings\n\
 - Mac: unreachable (ssh timed out)\n\
-- Leads: 2 circles have no lead: garmin-nav, pm-odd-jobs and more after that\n";
+- Leads: 2 circles have no lead: alpha, beta and more after that\n";
         let h = parse_health(text).unwrap();
         assert_eq!(h.level, HealthLevel::Warning);
         assert_eq!(h.status, "2 warnings");

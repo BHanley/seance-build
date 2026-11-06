@@ -1,9 +1,9 @@
 # Orchestrator ergonomics — running log
 
-Requests from the paceline realtime-v2 orchestrator (pane claude-38 driving
+Requests from the example orchestrator (pane claude-38 driving
 ~10 codex/claude workers in circle `codex-10`), 2026-09-27. Goal: driving
 many agents from seance should need no screen-scraping and no workarounds.
-Its dispatcher (`vita/…/2026-09-27-realtime-v2/dispatch_codex.py`) records
+Its dispatcher (`its dispatch script`) records
 every workaround this batch replaces.
 
 **Deploy model.** Two halves:
@@ -49,9 +49,9 @@ update menu gets Skip). Permission prompts are never auto-answered.
 
 ## Batch 4 — 2026-09-29: sessions talk by name (commits 6547ca2, 49f2119)
 
-Trigger: paceline-desk asked paceline-arch-impl a question and named
+Trigger: alpha-desk asked alpha-impl a question and named
 `claude-27` as the reply address. That was its own **circle** slug, but also
-the **pane** slug of cadence-slack, so the answer went to cadence-slack. Full
+the **pane** slug of slack-bridge, so the answer went to slack-bridge. Full
 design: docs/COMMS.md.
 
 - `ask --to CIRCLE` / `tell` / `reply m-N` / `await` / `messages`: messages,

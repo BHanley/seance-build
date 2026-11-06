@@ -453,7 +453,7 @@ Unreleased work can sit under `## [Unreleased]` until the version bump.
   went AFK from the phone or timed out show correctly.
   Each top mode gets its own band above the pins. A mode with no toggle
   fields is display-only, e.g. vita's `slack` mode, which lists the circles
-  whose pane holds a cadence slack thread.
+  whose pane holds a slack thread.
 - Phone web views show one pane at a time, with tabs across the top to switch
   panes. The active terminal fills the screen above the keyboard.
 - `--help` / `-h` anywhere on the `seance` command line prints top-level
@@ -2316,7 +2316,7 @@ diffed against baseline; state files load identically).
 ### Changed
 
 - Pane chrome design pass: owner accent rail, shorter titles, quieter action
-  cluster, higher inactive opacity (see `docs/DESIGN_PASS_2026-07-21.md`)
+  cluster, higher inactive opacity (design pass, 2026-07-21)
 - Workspace list **auto-sorts**: working → needs → done-unread → rest, each band
   by activity recency (input / inject / status), not click-to-select or PTY paint
 

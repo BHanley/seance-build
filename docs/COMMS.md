@@ -6,10 +6,10 @@ another, by the names the human uses. Code: `src/runtime/engine/comms.rs`
 
 ## Why
 
-2026-09-29: paceline-desk asked paceline-arch-impl a question and wrote
+2026-09-29: alpha-desk asked alpha-impl a question and wrote
 *"reply via `seance ctl send --all claude-27`"*. `claude-27` was desk's
 **circle** slug; `ctl send` resolves **panes**, and the pane named `claude-27`
-was cadence-slack's. The answer landed in the wrong session. The earlier FYIs
+was slack-bridge's. The answer landed in the wrong session. The earlier FYIs
 were `send`s too, so each opened a task and cancelled the one before it.
 
 Four problems, four fixes:
@@ -24,10 +24,10 @@ Four problems, four fixes:
 ## Verbs
 
 ```bash
-seance ctl ask --to paceline-arch-impl "does v2 touch group_commands.rb?"   # blocks, prints the answer
-seance ctl ask --to paceline-arch-impl --no-wait --file q.md               # returns m-N now
+seance ctl ask --to alpha-impl "does v2 touch widgets.rb?"   # blocks, prints the answer
+seance ctl ask --to alpha-impl --no-wait --file q.md               # returns m-N now
 seance ctl await m-12 [--timeout S]                                         # fetch / wait for an answer
-seance ctl tell paceline-desk "FYI: #23997 carries the guard"              # one-way
+seance ctl tell alpha-desk "FYI: #123 carries the guard"              # one-way
 seance ctl reply m-12 <<'EOF'                                               # answer (stdin read when piped)
 pick (a)
 EOF
@@ -47,7 +47,7 @@ within `--timeout` (default 600s) — the answer is still delivered later;
 
 | form | means |
 |---|---|
-| `paceline-arch-impl` | circle by current label → its lead |
+| `alpha-impl` | circle by current label → its lead |
 | `claude-47` | circle by slug → its lead |
 | an old label | the circle that had it (warns "was renamed to …"), unless another circle holds that label now |
 | `@name` | circle only |
@@ -66,7 +66,7 @@ count as oldest, in pane-list order).
 Messages go through the daemon's send-queue pump (every 500ms):
 
 - pasted into the recipient's agent TUI with a header — `📨 seance m-12 —
-  question from paceline-desk (pane claude-21): … Answer it with seance ctl
+  question from alpha-desk (pane claude-21): … Answer it with seance ctl
   reply m-12` — while it is **idle or busy** (a busy Claude queues it behind
   its turn; it is never interrupted), not while a modal is up, never over a
   human who is typing;

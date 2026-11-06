@@ -98,8 +98,6 @@ you both flip into. Visibility is the point.
 Native app on [GPUI](https://www.gpui.rs/). Sessions live in a long-lived
 daemon; the window is disposable.
 
-![seance](docs/screenshot.png)
-
 **License:** MIT · **Platform:** Linux (Wayland / X11) + macOS thin client · **Status:** 0.27.0
 
 Release notes: [`CHANGELOG.md`](CHANGELOG.md).

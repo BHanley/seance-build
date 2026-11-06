@@ -45,5 +45,5 @@ resets to a clean link. Not a video — a session you can *read*.
 ```
 No config → `seance replay export` still writes fully self-contained static
 bundles (open index.html anywhere). Vita's plugin lives in vita
-(`scripts/seance_share/publish_replay.py` → vita-reports.ham.xyz/rp/<token>);
+(`scripts/seance_share/publish_replay.py` → reports.example.com/rp/<token>);
 seance never learns what it is.

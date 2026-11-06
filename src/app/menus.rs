@@ -743,8 +743,8 @@ mod tests {
     #[test]
     fn select_command_substitutes_every_id_placeholder() {
         assert_eq!(
-            select_command("adapter select {id} --ref {id}", "mtg:2026-08-06/l10"),
-            "adapter select mtg:2026-08-06/l10 --ref mtg:2026-08-06/l10"
+            select_command("adapter select {id} --ref {id}", "mtg:2026-08-06/standup"),
+            "adapter select mtg:2026-08-06/standup --ref mtg:2026-08-06/standup"
         );
         // A template without the placeholder is left alone (host's choice).
         assert_eq!(select_command("adapter go", "x"), "adapter go");

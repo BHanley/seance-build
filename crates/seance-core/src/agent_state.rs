@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn claude_spinner_is_busy_and_quota_read() {
-        let s = classify(CLAUDE_BUSY, Some("◑ Paceline realtime v2"));
+        let s = classify(CLAUDE_BUSY, Some("◑ Example task"));
         assert_eq!(s.activity, Activity::Busy);
         assert!(s.evidence.unwrap().contains("Osmosing"));
         let q = s.quota.unwrap();
@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn queued_input_detected_and_not_mistaken_for_typed_text() {
-        let s = classify(CLAUDE_QUEUED, Some("◐ Paceline"));
+        let s = classify(CLAUDE_QUEUED, Some("◐ Example"));
         assert_eq!(s.activity, Activity::Busy);
         assert!(s.queued_input);
         assert_eq!(composer_text(CLAUDE_QUEUED).as_deref(), Some(""));

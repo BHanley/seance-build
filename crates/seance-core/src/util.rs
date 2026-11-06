@@ -163,7 +163,7 @@ mod busy_title_tests {
     #[test]
     fn the_circle_quadrant_spinner_reads_as_busy() {
         assert!(title_looks_busy("◐ Value per account churn adjustment"));
-        assert!(title_looks_busy("◑ Ad monitoring integration into Cadence"));
+        assert!(title_looks_busy("◑ Ad monitoring integration into Reports"));
         assert!(title_looks_busy("◒ working"));
         assert!(title_looks_busy("◓ working"));
     }
