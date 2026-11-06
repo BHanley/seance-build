@@ -1,0 +1,1091 @@
+//! seance daemon process — owns the session engine and serves ctl + GUI + handoff.
+
+use std::io::{BufRead, BufReader, IoSlice, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use anyhow::{bail, Context as _, Result};
+
+pub mod agentsessions;
+pub mod fsbridge;
+pub mod modewatch;
+pub mod sleepsweep;
+
+use crate::control::{self, ControlRequest, ControlResponse};
+use crate::runtime::engine::{Engine, OwnedFdAdopt};
+use crate::runtime::outqueue::OutQueue;
+use crate::runtime::protocol::{GuiEvent, GuiRequest, HandoffBundle, Hello};
+use crate::runtime::{daemon_pid_path, SessionEvent, SharedEngine};
+
+/// Entry: `seance daemon` or `seance daemon --takeover PATH`.
+pub fn run_daemon(args: Vec<String>) -> ! {
+    let code = match run_daemon_inner(args) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("[seance daemon] fatal: {e:#}");
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
+/// A daemon spawned by a pre-CLOEXEC daemon (`seance upgrade`) inherits every
+/// pane master it held. Real masters only ever arrive over the handoff
+/// socket, so any `/dev/ptmx` open at startup is a leak that would keep those
+/// ttys from hanging up and pass on to every pane spawned here.
+#[cfg(target_os = "linux")]
+fn close_inherited_pty_masters() {
+    let Ok(rd) = std::fs::read_dir("/proc/self/fd") else {
+        return;
+    };
+    let leaked: Vec<i32> = rd
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|fd| *fd > 2)
+        .filter(|fd| {
+            std::fs::read_link(format!("/proc/self/fd/{fd}"))
+                .is_ok_and(|t| t == std::path::Path::new("/dev/ptmx"))
+        })
+        .collect();
+    for fd in &leaked {
+        unsafe {
+            libc::close(*fd);
+        }
+    }
+    if !leaked.is_empty() {
+        eprintln!(
+            "[seance daemon] closed {} inherited pty master fd(s)",
+            leaked.len()
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn close_inherited_pty_masters() {}
+
+fn run_daemon_inner(args: Vec<String>) -> Result<()> {
+    close_inherited_pty_masters();
+    // Before any pane is spawned or adopted: their palettes seed from it.
+    crate::looks::boot();
+    // Install shell integration rc.
+    let rc = crate::pane::shell_rc_path();
+    if let Some(dir) = rc.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&rc, include_str!("../../assets/seance.bash"));
+
+    let takeover = args
+        .windows(2)
+        .find(|w| w[0] == "--takeover")
+        .map(|w| PathBuf::from(&w[1]));
+    let is_takeover = takeover.is_some();
+
+    let (engine, event_rx) = if let Some(ref handoff_sock) = takeover {
+        eprintln!("[seance daemon] takeover from {}", handoff_sock.display());
+        receive_handoff(handoff_sock)?
+    } else {
+        Engine::new()?
+    };
+
+    let mut engine = engine;
+    // Arm the session-replay ring recorder (48h DVR; `seance replay` reads it).
+    // The recorder is also the activity tap: it is the only place that already
+    // knows "real content change at unchanged dimensions", so it emits
+    // (pane, unix_ms) notes which we forward into the engine's own session
+    // event pump — that keeps the per-workspace clock daemon-owned.
+    let (notes_tx, notes_rx) = std::sync::mpsc::channel::<crate::runtime::recorder::ActivityNote>();
+    engine.set_recorder(crate::runtime::recorder::spawn(
+        crate::runtime::state_data_dir().join("replay"),
+        notes_tx,
+    ));
+    let notes_event_tx = engine.event_sender();
+    let engine = Arc::new(Mutex::new(engine));
+
+    // Recorder activity notes → session events (one hop, no engine lock here).
+    thread::Builder::new()
+        .name("seance-activity".into())
+        .spawn(move || {
+            while let Ok((slug, t_ms)) = notes_rx.recv() {
+                if notes_event_tx
+                    .send(SessionEvent::ActivityNote { slug, t_ms })
+                    .is_err()
+                {
+                    break; // engine gone — nothing left to notify
+                }
+            }
+        })
+        .ok();
+
+    // Session event pump → broadcast grids.
+    {
+        let eng = Arc::clone(&engine);
+        thread::Builder::new()
+            .name("seance-events".into())
+            .spawn(move || {
+                // Per-event probes only under SEANCE_DEBUG_RENDER: an output
+                // storm drives this loop at 100k+ events/s and the aggregate
+                // lock would become its own overhead.
+                let debug = std::env::var_os("SEANCE_DEBUG_RENDER").is_some();
+                while let Ok(ev) = event_rx.recv() {
+                    if debug {
+                        let t0 = std::time::Instant::now();
+                        if let Ok(mut e) = eng.lock() {
+                            crate::latency_probe::record(
+                                "daemon pump lockwait",
+                                t0.elapsed().as_micros() as u64,
+                            );
+                            let t1 = std::time::Instant::now();
+                            e.handle_session_event(ev);
+                            crate::latency_probe::record(
+                                "daemon pump handle",
+                                t1.elapsed().as_micros() as u64,
+                            );
+                        }
+                    } else if let Ok(mut e) = eng.lock() {
+                        e.handle_session_event(ev);
+                    }
+                }
+            })
+            .ok();
+    }
+
+    // Daemon-side host widget poller (thin clients see this machine's chips).
+    fsbridge::start_host_poller(Arc::clone(&engine));
+
+    // Host circle modes (AFK) the host owns: poll its state_cmd.
+    modewatch::start_mode_poller(Arc::clone(&engine));
+    // Idle Claude panes stop holding RAM (terminal.conf `seance-auto-sleep-idle`).
+    sleepsweep::start_sleep_sweeper(Arc::clone(&engine));
+    agentsessions::start_agent_session_watcher(Arc::clone(&engine));
+    // `send --queue`: deliver queued tasks when their pane goes idle.
+    {
+        let engine = Arc::clone(&engine);
+        std::thread::Builder::new()
+            .name("seance-send-queue".into())
+            .spawn(move || loop {
+                std::thread::sleep(crate::runtime::engine::queue::PUMP_EVERY);
+                let Ok(mut eng) = engine.lock() else { continue };
+                let now = crate::runtime::engine::helpers::now_ms();
+                if eng.pump_send_queue(now) {
+                    eng.persist();
+                    eng.push_state_to_all();
+                }
+            })
+            .ok();
+    }
+
+    // Write pid file.
+    let pid_path = daemon_pid_path();
+    if let Some(dir) = pid_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&pid_path, format!("{}\n", std::process::id()));
+
+    let sock_path = control::bind_socket_path();
+    // Remove stale socket if we own the world.
+    // On takeover, the old daemon may still be closing — wait briefly for it
+    // to drop the control socket, then bind.
+    if is_takeover {
+        for _ in 0..50 {
+            if !sock_path.exists() {
+                break;
+            }
+            // If the path exists but nothing listens, remove it.
+            if UnixStream::connect(&sock_path).is_err() {
+                let _ = std::fs::remove_file(&sock_path);
+                break;
+            }
+            thread::sleep(Duration::from_millis(40));
+        }
+        if sock_path.exists() {
+            // Force: old process should have exited by now.
+            let _ = std::fs::remove_file(&sock_path);
+        }
+    } else if sock_path.exists() {
+        match UnixStream::connect(&sock_path) {
+            Ok(_) => bail!(
+                "another seance daemon is already listening at {}",
+                sock_path.display()
+            ),
+            Err(_) => {
+                let _ = std::fs::remove_file(&sock_path);
+            }
+        }
+    }
+    if let Some(parent) = sock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let listener =
+        UnixListener::bind(&sock_path).with_context(|| format!("bind {}", sock_path.display()))?;
+    eprintln!("[seance daemon] listening on {}", sock_path.display());
+    eprintln!("[seance daemon] pid {}", std::process::id());
+
+    // Accept loop.
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let eng = Arc::clone(&engine);
+                thread::Builder::new()
+                    .name("seance-conn".into())
+                    .spawn(move || {
+                        if let Err(e) = handle_connection(stream, eng) {
+                            eprintln!("[seance daemon] connection error: {e:#}");
+                        }
+                    })
+                    .ok();
+            }
+            Err(e) => eprintln!("[seance daemon] accept: {e}"),
+        }
+    }
+    Ok(())
+}
+
+fn handle_connection(stream: UnixStream, engine: SharedEngine) -> Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = stream;
+    let mut line = String::new();
+    let n = reader.read_line(&mut line)?;
+    if n == 0 || line.trim().is_empty() {
+        // Probe connect (ensure_daemon / single-instance check) — silent.
+        return Ok(());
+    }
+    let hello: Hello = serde_json::from_str(line.trim()).context("hello parse")?;
+    // Strict version gate for ctl/gui: thin clients may connect from other
+    // machines, and skew between client and daemon silently corrupts the
+    // protocol. Exact build match or a loud refusal. handoff/upgrade are
+    // exempt — they cross versions by design.
+    if matches!(hello.role.as_str(), "ctl" | "gui") {
+        let daemon_build = env!("CARGO_PKG_VERSION");
+        if hello.build.as_deref() != Some(daemon_build) {
+            let got = hello.build.as_deref().unwrap_or("<absent>");
+            let _ = writeln!(
+                writer,
+                "{}",
+                serde_json::to_string(&ControlResponse::err(format!(
+                    "version mismatch: daemon is seance {daemon_build}, client is {got} — \
+                     upgrade the older side (`cargo build --release && seance upgrade` \
+                     on the daemon host, or redeploy the client binary)"
+                )))?
+            );
+            return Ok(());
+        }
+    }
+    match hello.role.as_str() {
+        "ctl" => serve_ctl(reader, writer, engine),
+        "gui" => serve_gui(reader, writer, engine),
+        "handoff" => {
+            // Only accepted when we're the old daemon exporting state.
+            serve_handoff_export(writer, engine)
+        }
+        "upgrade" => {
+            // GUI or CLI asked this daemon to upgrade itself.
+            serve_upgrade_request(writer, engine)
+        }
+        other => {
+            let _ = writeln!(
+                writer,
+                "{}",
+                serde_json::to_string(&ControlResponse::err(format!("unknown role '{other}'")))?
+            );
+            Ok(())
+        }
+    }
+}
+
+fn serve_ctl(
+    reader: BufReader<UnixStream>,
+    mut writer: UnixStream,
+    engine: SharedEngine,
+) -> Result<()> {
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let req: ControlRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                let resp = ControlResponse::err(format!("bad request: {e}"));
+                writeln!(writer, "{}", serde_json::to_string(&resp)?)?;
+                continue;
+            }
+        };
+        // Streaming watch: ack then push matching events until disconnect.
+        if let ControlRequest::Watch {
+            since_seq,
+            kinds,
+            pane,
+            actor,
+            catch_up,
+            scope,
+            from: _,
+        } = req
+        {
+            return serve_watch(
+                writer,
+                engine,
+                since_seq.unwrap_or(0),
+                kinds,
+                pane,
+                actor,
+                scope,
+                catch_up,
+            );
+        }
+        let resp = engine
+            .lock()
+            .map(|mut e| e.handle_control(req))
+            .unwrap_or_else(|_| ControlResponse::err("engine lock poisoned"));
+        writeln!(writer, "{}", serde_json::to_string(&resp)?)?;
+    }
+    Ok(())
+}
+
+/// Stream events matching filters as JSON lines after an initial ack.
+fn serve_watch(
+    mut writer: UnixStream,
+    engine: SharedEngine,
+    since_seq: u64,
+    kinds: Option<Vec<String>>,
+    pane: Option<String>,
+    actor: Option<String>,
+    scope: Option<String>,
+    catch_up: bool,
+) -> Result<()> {
+    use crate::events;
+
+    // Watch bypasses handle_control, but its pane filter accepts the same
+    // explicit lifetime IDs as the one-shot commands.
+    let pane = if let Some(key) = pane.as_ref().filter(|p| p.starts_with("id:")) {
+        let resp = engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine lock poisoned"))?
+            .handle_control(ControlRequest::Status {
+                pane: key.clone(),
+                scope: scope.clone(),
+                from: None,
+            });
+        if !resp.ok {
+            writeln!(writer, "{}", serde_json::to_string(&resp)?)?;
+            return Ok(());
+        }
+        resp.data
+            .and_then(|row| row["slug"].as_str().map(str::to_string))
+    } else {
+        pane
+    };
+
+    let (rx, cursor) = events::subscribe();
+    let ack = ControlResponse::ok(serde_json::json!({
+        "watching": true,
+        "cursor": cursor,
+        "since_seq": since_seq,
+    }));
+    writeln!(writer, "{}", serde_json::to_string(&ack)?)?;
+    writer.flush()?;
+
+    let kinds_ref = kinds.as_deref();
+    let write_ev = |writer: &mut UnixStream, e: &events::Event| -> Result<()> {
+        if !events::matches_filter(
+            e,
+            scope.as_deref(),
+            pane.as_deref(),
+            actor.as_deref(),
+            kinds_ref,
+        ) {
+            return Ok(());
+        }
+        // Wrap as ControlResponse so clients can share the same decoder.
+        let resp = ControlResponse::ok(serde_json::to_value(e)?);
+        writeln!(writer, "{}", serde_json::to_string(&resp)?)?;
+        writer.flush()?;
+        Ok(())
+    };
+
+    if catch_up {
+        // Prefer in-memory ring; fall back to disk for deeper history.
+        let mut backlog = events::ring_since(since_seq);
+        if backlog.is_empty() && since_seq > 0 {
+            backlog = events::read_ex(
+                0,
+                since_seq,
+                scope.as_deref(),
+                pane.as_deref(),
+                actor.as_deref(),
+                kinds.as_deref(),
+                500,
+            );
+        } else if backlog.is_empty() && since_seq == 0 {
+            // Fresh subscriber with no cursor: last 50 matching from disk.
+            backlog = events::read_ex(
+                0,
+                0,
+                scope.as_deref(),
+                pane.as_deref(),
+                actor.as_deref(),
+                kinds.as_deref(),
+                50,
+            );
+        }
+        for e in backlog {
+            write_ev(&mut writer, &e)?;
+        }
+    }
+
+    // Live stream until client disconnects or write fails.
+    while let Ok(e) = rx.recv() {
+        if write_ev(&mut writer, &e).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn serve_gui(
+    mut reader: BufReader<UnixStream>,
+    writer: UnixStream,
+    engine: SharedEngine,
+) -> Result<()> {
+    let writer = Arc::new(Mutex::new(writer));
+    // Coalescing queue, not an unbounded channel: a blocked socket write must
+    // not let grid frames pile up unbounded behind it, or the client ends up
+    // watching a backlog drain instead of the present. See runtime::outqueue.
+    let out = Arc::new(OutQueue::new());
+
+    // Register for broadcasts — one connection = one window.
+    let window_id = {
+        let mut eng = engine.lock().unwrap();
+        eng.register_gui(Arc::clone(&out))
+    };
+
+    // Fresh window gets the latest host widgets without waiting a poll tick.
+    if let Some(widgets) = fsbridge::latest_host_widgets() {
+        out.push_event(GuiEvent::HostWidgets { widgets });
+    }
+
+    // Writer thread for push events.
+    {
+        let writer = Arc::clone(&writer);
+        let out = Arc::clone(&out);
+        thread::spawn(move || {
+            loop {
+                let batch = out.drain_blocking();
+                if batch.is_empty() {
+                    break; // queue closed
+                }
+                for item in batch {
+                    let is_grid = matches!(item, crate::runtime::outqueue::Outgoing::Grid { .. });
+                    // Encoding here rather than at push time is the point: a
+                    // backed-up connection encodes once per frame it actually
+                    // sends, not once per frame it never sends.
+                    let Ok(json) = serde_json::to_string(&item.into_event()) else {
+                        continue;
+                    };
+                    if is_grid {
+                        crate::latency_probe::count("daemon grid wire", json.len() as u64 + 1);
+                    }
+                    let write_t0 = std::time::Instant::now();
+                    let mut w = writer.lock().unwrap();
+                    if writeln!(w, "{json}").is_err() {
+                        out.close();
+                        return;
+                    }
+                    // Time spent inside the socket write is time the transport
+                    // could not take the bytes — the other half of the stage
+                    // that used to be invisible between daemon and GUI.
+                    crate::latency_probe::record(
+                        "daemon socket write",
+                        write_t0.elapsed().as_micros() as u64,
+                    );
+                }
+            }
+        });
+    }
+
+    // Read requests.
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let req: GuiRequest = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(e) => {
+                let ev = GuiEvent::Error {
+                    message: format!("bad gui request: {e}"),
+                };
+                out.push_event(ev);
+                continue;
+            }
+        };
+        // Flow-control acks arrive at frame rate and touch nothing but this
+        // connection's send window — handling them here keeps them off the
+        // engine lock entirely.
+        if let GuiRequest::GridAck { seq } = req {
+            out.ack(seq);
+            continue;
+        }
+        // Fs bridge ops run on their own thread: disk / host-select latency
+        // must never stall the input pipeline. Correlated by id.
+        if let GuiRequest::Fs { id, fs } = req {
+            let out = Arc::clone(&out);
+            let engine = Arc::clone(&engine);
+            thread::Builder::new()
+                .name("seance-fs-op".into())
+                .spawn(move || {
+                    let (ok, data, error) = fsbridge::run(fs, &engine);
+                    out.push_event(GuiEvent::FsResult {
+                        id,
+                        ok,
+                        data,
+                        error,
+                    });
+                })
+                .ok();
+            continue;
+        }
+        let is_bye = matches!(req, GuiRequest::Bye);
+        let is_input = if let GuiRequest::Input { pane, .. } = &req {
+            crate::latency_probe::mark("d_input", pane);
+            true
+        } else {
+            false
+        };
+        let t0 = std::time::Instant::now();
+        let mut eng = engine.lock().unwrap();
+        if is_input {
+            crate::latency_probe::record("daemon input lockwait", t0.elapsed().as_micros() as u64);
+        }
+        let t1 = std::time::Instant::now();
+        let reply = eng.handle_gui(req, &window_id);
+        if is_input {
+            crate::latency_probe::record("daemon input handle", t1.elapsed().as_micros() as u64);
+        }
+        drop(eng);
+        if let Some(ev) = reply {
+            out.push_event(ev);
+        }
+        if is_bye {
+            // Bye already ran unregister_gui; drop the connection.
+            break;
+        }
+    }
+    // Socket EOF (or post-Bye) — free / reassign if still registered.
+    if let Ok(mut eng) = engine.lock() {
+        eng.unregister_gui(&window_id);
+    }
+    Ok(())
+}
+
+fn serve_handoff_export(mut writer: UnixStream, engine: SharedEngine) -> Result<()> {
+    // This is the OLD daemon exporting to a new one — actually handoff is
+    // initiated by serve_upgrade_request which spawns the new daemon.
+    let _ = writeln!(
+        writer,
+        "{}",
+        serde_json::json!({"ok": false, "error": "use role upgrade on the live daemon"})
+    );
+    let _ = engine;
+    Ok(())
+}
+
+/// Serialize upgrades: only one `serve_upgrade_request` may run per daemon.
+/// Two racing requests would each spawn a new daemon, bind-race the handoff
+/// socket, and double-run `prepare_upgrade` — whichever exits first kills the
+/// other mid-handoff.
+static UPGRADE_SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Resets [`UPGRADE_SERVING`] on any early return from a failed upgrade so a
+/// later attempt can proceed. The happy path exits the process (skipping this
+/// drop) — fine, the successor daemon starts with a fresh flag.
+struct UpgradeGate;
+impl Drop for UpgradeGate {
+    fn drop(&mut self) {
+        UPGRADE_SERVING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn serve_upgrade_request(mut writer: UnixStream, engine: SharedEngine) -> Result<()> {
+    eprintln!("[seance daemon] upgrade requested");
+    // Reject a concurrent upgrade rather than racing two teardowns.
+    if UPGRADE_SERVING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        eprintln!("[seance daemon] upgrade rejected: another upgrade already in flight");
+        let _ = writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"ok": false, "error": "upgrade already in progress"})
+        );
+        let _ = writer.flush();
+        return Ok(());
+    }
+    let _gate = UpgradeGate;
+    let handoff_path = {
+        let mut p = control::bind_socket_path();
+        p.set_extension("handoff.sock");
+        p
+    };
+    if handoff_path.exists() {
+        let _ = std::fs::remove_file(&handoff_path);
+    }
+    let handoff_listener = UnixListener::bind(&handoff_path)?;
+
+    // Spawn new daemon binary with --takeover. Log to a side file so
+    // upgrade failures are diagnosable (stdout/stderr of the old daemon
+    // may already be redirected).
+    //
+    // IMPORTANT: after `cargo build --release`, the running daemon's inode is
+    // unlinked — `current_exe()` becomes `…/seance (deleted)` and spawn fails
+    // with ENOENT. Prefer the on-disk path at the same location (the new
+    // binary), then SEANCE_BIN, then PATH.
+    let bin = resolve_upgrade_bin().context("resolve upgrade binary")?;
+    eprintln!("[seance daemon] upgrade spawning {}", bin.display());
+    let log_path = crate::runtime::state_data_dir().join("daemon-upgrade.log");
+    if let Some(dir) = log_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Appended, not truncated: the daemon this upgrade replaces may still hold
+    // the file at its old offset, and truncating under it filled the log
+    // with NULs up to there.
+    let log_file = open_log(&log_path).context("daemon-upgrade.log")?;
+    let child = std::process::Command::new(&bin)
+        .arg("daemon")
+        .arg("--takeover")
+        .arg(&handoff_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file)
+        .spawn()
+        .with_context(|| format!("spawn upgraded daemon from {}", bin.display()))?;
+
+    // Accept handoff connection from new daemon.
+    handoff_listener.set_nonblocking(false)?;
+    // Timeout accept.
+    let (conn, _) = handoff_listener
+        .accept()
+        .context("waiting for new daemon handoff connect")?;
+
+    // Prepare state + FDs.
+    let (bundle, fds) = {
+        let mut eng = engine.lock().unwrap();
+        eng.prepare_upgrade()?
+    };
+
+    // Send bundle JSON + SCM_RIGHTS.
+    send_handoff(conn, &bundle, &fds)?;
+
+    // Reply *before* tearing down the control socket so the client never
+    // races an unlink into EAGAIN/EOF on a half-closed stream.
+    //
+    // Best-effort on purpose: the handoff already happened and the new daemon
+    // is live, so we MUST fall through to teardown + exit even if the client
+    // vanished (e.g. Ctrl-C mid-upgrade → EPIPE). Bailing here would strand the
+    // old daemon holding the control socket while the new daemon can never bind.
+    {
+        let line = serde_json::json!({"ok": true, "pid": child.id()}).to_string();
+        if let Err(e) = writeln!(writer, "{line}") {
+            eprintln!("[seance daemon] upgrade: client write failed, tearing down anyway: {e}");
+        }
+        let _ = writer.flush();
+        // Half-close write so the client sees EOF after the line, not a hang.
+        let _ = writer.shutdown(std::net::Shutdown::Write);
+    }
+
+    // Drop control socket FIRST so the new daemon can bind, then exit.
+    // Children stay alive: prepare_upgrade already released master FDs
+    // without SIGHUP.
+    let _ = std::fs::remove_file(control::bind_socket_path());
+    let _ = std::fs::remove_file(&handoff_path);
+    eprintln!("[seance daemon] upgrade complete, exiting old process");
+    // Small delay so sendmsg flush / client response lands.
+    thread::sleep(Duration::from_millis(80));
+    std::process::exit(0);
+}
+
+fn receive_handoff(handoff_sock: &PathBuf) -> Result<(Engine, mpsc::Receiver<SessionEvent>)> {
+    // Connect to old daemon's handoff listener.
+    let mut last_err = None;
+    let mut stream = None;
+    for _ in 0..50 {
+        match UnixStream::connect(handoff_sock) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    let stream = stream.with_context(|| format!("connect handoff: {last_err:?}"))?;
+
+    let (bundle, fds) = recv_handoff(stream)?;
+    let adopted: Vec<(usize, OwnedFdAdopt)> = fds
+        .into_iter()
+        .enumerate()
+        .map(|(i, fd)| (i, OwnedFdAdopt { fd }))
+        .collect();
+    Engine::from_handoff(bundle, adopted)
+}
+
+/// Send handoff bundle + file descriptors via SCM_RIGHTS.
+fn send_handoff(mut stream: UnixStream, bundle: &HandoffBundle, fds: &[OwnedFd]) -> Result<()> {
+    let json = serde_json::to_string(bundle)?;
+    let len = (json.len() as u32).to_le_bytes();
+    stream.write_all(&len)?;
+    stream.write_all(json.as_bytes())?;
+
+    if fds.is_empty() {
+        return Ok(());
+    }
+
+    let raws: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
+    // Send a single dummy byte with the FDs.
+    let dummy = [0u8];
+    let _iov = [IoSlice::new(&dummy)];
+    // cmsg buffer
+    let fd_bytes = unsafe {
+        std::slice::from_raw_parts(
+            raws.as_ptr() as *const u8,
+            raws.len() * std::mem::size_of::<RawFd>(),
+        )
+    };
+    // Use nix-less sendmsg via libc.
+    let mut cbuf = vec![0u8; unsafe { libc::CMSG_SPACE((fd_bytes.len()) as u32) as usize }];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    let mut iov_c = libc::iovec {
+        iov_base: dummy.as_ptr() as *mut _,
+        iov_len: 1,
+    };
+    msg.msg_iov = &mut iov_c;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf.as_mut_ptr() as *mut _;
+    msg.msg_controllen = cbuf.len() as _;
+
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            bail!("CMSG_FIRSTHDR null");
+        }
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN((fd_bytes.len()) as u32) as _;
+        std::ptr::copy_nonoverlapping(
+            fd_bytes.as_ptr(),
+            libc::CMSG_DATA(cmsg) as *mut u8,
+            fd_bytes.len(),
+        );
+        let n = libc::sendmsg(stream.as_raw_fd(), &msg, 0);
+        if n < 0 {
+            bail!("sendmsg: {}", std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn recv_handoff(stream: UnixStream) -> Result<(HandoffBundle, Vec<OwnedFd>)> {
+    use std::io::Read;
+    let mut stream = stream;
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut json = vec![0u8; len];
+    stream.read_exact(&mut json)?;
+    let bundle: HandoffBundle = serde_json::from_slice(&json)?;
+
+    let n_fds = bundle.panes.iter().filter_map(|p| p.fd_index).count();
+    if n_fds == 0 {
+        return Ok((bundle, Vec::new()));
+    }
+
+    let mut dummy = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: dummy.as_mut_ptr() as *mut _,
+        iov_len: 1,
+    };
+    let mut cbuf =
+        vec![
+            0u8;
+            unsafe { libc::CMSG_SPACE((n_fds * std::mem::size_of::<RawFd>()) as u32) as usize }
+        ];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf.as_mut_ptr() as *mut _;
+    msg.msg_controllen = cbuf.len() as _;
+
+    let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
+    if n < 0 {
+        bail!("recvmsg: {}", std::io::Error::last_os_error());
+    }
+
+    let mut fds = Vec::new();
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(cmsg) as *const RawFd;
+                let bytes = (*cmsg).cmsg_len as usize - (data as usize - cmsg as usize);
+                let count = bytes / std::mem::size_of::<RawFd>();
+                for i in 0..count {
+                    let fd = *data.add(i);
+                    // A pane master without CLOEXEC leaks into every pane spawned
+                    // later, and the tty then never hangs up when its pane dies.
+                    crate::runtime::pty_session::set_cloexec(fd);
+                    fds.push(OwnedFd::from_raw_fd(fd));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    Ok((bundle, fds))
+}
+
+/// Resolve the binary to exec for `seance upgrade`.
+///
+/// When a running daemon's binary has been replaced by `cargo build`, Linux
+/// leaves the old inode mapped and `current_exe()` reports
+/// `…/seance (deleted)`. Spawning that path fails. The *new* binary lives at
+/// the original path without the suffix — use that when present.
+fn resolve_upgrade_bin() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("SEANCE_BIN") {
+        let pb = PathBuf::from(&p);
+        if pb.is_file() {
+            return Ok(pb);
+        }
+    }
+    let exe = std::env::current_exe().context("current_exe")?;
+    let s = exe.to_string_lossy();
+    // Kernel may append " (deleted)" when the file was unlinked under us.
+    let cleaned = s
+        .strip_suffix(" (deleted)")
+        .or_else(|| s.strip_suffix(" (deleted)"))
+        .unwrap_or(s.as_ref());
+    let cleaned = PathBuf::from(cleaned);
+    if cleaned.is_file() {
+        return Ok(cleaned);
+    }
+    if exe.is_file() {
+        return Ok(exe);
+    }
+    // PATH lookup.
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':') {
+            let candidate = PathBuf::from(dir).join("seance");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    bail!(
+        "cannot find seance binary to upgrade to (current_exe={})",
+        exe.display()
+    );
+}
+
+/// Append handle for `<state-dir>/daemon.log`, rotated to `.1` past ~5 MiB —
+/// same shape as the GUI's stderr log. `None` if the state dir or the file
+/// can't be opened; the caller falls back to `/dev/null`.
+fn daemon_log_file() -> Option<std::fs::File> {
+    let dir = crate::state::state_dir().ok()?;
+    let _ = std::fs::create_dir_all(&dir);
+    let mut file = open_log(&dir.join("daemon.log")).ok()?;
+    // Who started this daemon, and which build — the two questions asked
+    // first when a session's panes turn out to belong to someone else's
+    // daemon.
+    let _ = writeln!(
+        file,
+        "\n--- seance daemon spawn requested by pid={} version={} ---",
+        std::process::id(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    Some(file)
+}
+
+/// Open a daemon log for appending (O_APPEND, so every writer lands at the
+/// end), first rotating it to `<name>.1` past ~5 MiB.
+fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    const MAX: u64 = 5 * 1024 * 1024;
+    if std::fs::metadata(path).is_ok_and(|m| m.len() >= MAX) {
+        let mut rotated = path.as_os_str().to_owned();
+        rotated.push(".1");
+        let _ = std::fs::rename(path, rotated);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+/// Ensure a daemon is running; spawn one if needed. Returns true if we spawned.
+pub fn ensure_daemon() -> Result<bool> {
+    let path = control::socket_path();
+    if path.exists() {
+        if UnixStream::connect(&path).is_ok() {
+            return Ok(false);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    let bin = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("daemon").stdin(std::process::Stdio::null());
+    // The daemon spawned this way is usually the one nobody can see: started
+    // over ssh by a thin client's `_ensure-daemon`, with no terminal attached
+    // on either end. Sending its output to /dev/null meant a remote daemon
+    // that refused connections, or died, left nothing behind to read — the
+    // whole diagnosis had to be reconstructed from sshd's log (2026-08-20).
+    // Best-effort: if the log won't open, fall back to null rather than
+    // failing the spawn.
+    match daemon_log_file() {
+        Some(log) => match log.try_clone() {
+            Ok(err_half) => {
+                cmd.stdout(std::process::Stdio::from(log))
+                    .stderr(std::process::Stdio::from(err_half));
+            }
+            Err(_) => {
+                cmd.stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+            }
+        },
+        None => {
+            cmd.stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
+    }
+    cmd.spawn().context("spawn seance daemon")?;
+    // Wait for socket.
+    for _ in 0..100 {
+        if path.exists() && UnixStream::connect(&path).is_ok() {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    bail!("daemon did not become ready");
+}
+
+/// Ask the live daemon to upgrade to this binary.
+pub fn request_upgrade() -> Result<()> {
+    let mut stream =
+        UnixStream::connect(control::socket_path()).context("connect to daemon for upgrade")?;
+    // Blocking + long timeout: handoff with many panes can take >30s, and a
+    // nonblocking socket races into EAGAIN (os error 11) on read_line.
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+    writeln!(stream, r#"{{"role":"upgrade"}}"#).context("write upgrade hello")?;
+    let _ = stream.flush();
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    // Retry Interrupted / WouldBlock — observed under load when the daemon is
+    // mid-handoff and the kernel returns EAGAIN despite SO_RCVTIMEO.
+    let n = {
+        let mut last_err = None;
+        let mut got = 0usize;
+        for attempt in 0..40 {
+            // Do NOT clear `line` between retries: read_line *appends*, so a
+            // partial line read before a WouldBlock/timeout is resumed on the
+            // next attempt rather than silently discarded (which would corrupt
+            // the JSON we parse below).
+            match reader.read_line(&mut line) {
+                Ok(n) => {
+                    got = n;
+                    last_err = None;
+                    break;
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::Interrupted
+                        || e.raw_os_error() == Some(11) /* EAGAIN */ =>
+                {
+                    last_err = Some(e);
+                    // First attempts: brief yield. Later: slightly longer.
+                    let ms = if attempt < 10 { 25 } else { 100 };
+                    thread::sleep(Duration::from_millis(ms));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    bail!(
+                        "upgrade timed out waiting for daemon reply \
+                         (check ~/.local/share/seance/daemon-upgrade.log)"
+                    );
+                }
+                Err(e) => return Err(e).context("read upgrade response"),
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e).context(
+                "read upgrade response: still WouldBlock/EAGAIN after retries \
+                 (daemon busy or upgrade already in flight? check daemon-upgrade.log)",
+            );
+        }
+        got
+    };
+    if n == 0 {
+        bail!(
+            "daemon closed upgrade connection without reply \
+             (check ~/.local/share/seance/daemon-upgrade.log)"
+        );
+    }
+    eprintln!("[seance] upgrade response: {}", line.trim());
+    let v: serde_json::Value =
+        serde_json::from_str(line.trim()).context("parse upgrade response")?;
+    if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+        let err = v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("unknown upgrade failure");
+        bail!("{err}");
+    }
+    // Wait for new daemon to bind the control socket (handoff can lag).
+    for _ in 0..100 {
+        if UnixStream::connect(control::socket_path()).is_ok() {
+            // Brief settle so first ctl/GUI attach doesn't race empty accept.
+            thread::sleep(Duration::from_millis(50));
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    bail!("upgraded daemon did not become ready on control socket");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_log;
+    use std::io::Write;
+
+    /// Two writers on one log (an old daemon and the one replacing it) both
+    /// land at the end: no truncation, no gap of NULs.
+    #[test]
+    fn logs_are_appended_never_truncated() {
+        let path = std::env::temp_dir().join(format!("seance-log-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut old = open_log(&path).unwrap();
+        old.write_all(b"old daemon line\n").unwrap();
+        let mut new = open_log(&path).unwrap();
+        new.write_all(b"new daemon line\n").unwrap();
+        old.write_all(b"old again\n").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "old daemon line\nnew daemon line\nold again\n");
+        let _ = std::fs::remove_file(&path);
+    }
+}

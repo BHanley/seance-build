@@ -1,0 +1,151 @@
+# Remote / thin-client mode
+
+Seance's GUI is a thin client: every PTY, file pane, scratchpad, host widget,
+and the shared layout live in the **daemon**, and the GUI renders pushed
+state. That makes "run the GUI here, daemon over there" a transport question,
+not an architecture question — the transport is an ssh-forwarded unix socket.
+
+One deliberate exception: `~/.config/seance/terminal.conf` is read on both
+ends. The daemon takes the palette from its copy; the GUI takes the font,
+default fg/bg, bell sound and command-finish rule from the local copy, since
+those are per-device preferences (a laptop screen wants a different font size
+than a desktop, and the sound file lives on the machine that plays it).
+
+## Using it
+
+Launch `seance` with no local daemon running → the **picker** asks where your
+daemon lives:
+
+- **connect to remote host** — type an ssh destination (e.g. `desk`), enter.
+  Seance establishes `ssh -N -L <local.sock>:<remote.sock> host`, auto-starts
+  the remote daemon if needed (`seance _ensure-daemon` over ssh), and connects
+  through the forward.
+- **run locally** — classic single-machine mode (spawns a local daemon).
+
+The choice persists at `~/.config/seance/launch.json` and prefills next time;
+with a saved remote preference, later launches go straight to the tunnel with
+no picker. CLI overrides (also rewrite the preference):
+
+```bash
+seance --remote desk    # thin client to desk
+seance --local          # back to the local daemon
+```
+
+## Transport
+
+- Forward: `ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes
+  -o ServerAliveInterval=15 -o StreamLocalBindUnlink=yes -L …` — spawned and
+  supervised by the GUI (`src/tunnel.rs`). It dies with the GUI (Drop +
+  `on_app_quit`; PDEATHSIG on Linux) and respawns with backoff if ssh drops.
+  The GUI's own socket supervisor then re-attaches through the fresh forward.
+- Passwordless ssh (keys/agent) is required — BatchMode never prompts. When
+  auth fails, the error includes a copy-pasteable `autossh` stopgap you can
+  run in a terminal (type the password once, leave it up) and pick
+  remote again.
+- `seance ctl …` follows the same saved remote host, including when the GUI
+  is closed. It runs the host's CLI over SSH internally, so agent profiles,
+  scratchpads, and completion checks use the daemon's filesystem. There is
+  no separate CLI host configuration or dependency on the GUI's tunnel.
+- `SEANCE_SOCKET` and in-pane `SEANCE_SESSION` take precedence over the saved
+  host. `seance ctl --local …` bypasses the preference explicitly. Remote
+  failures never fall back to a local daemon or retry an uncertain mutation.
+  SSH transport failures exit 255; daemon/CLI exit codes pass through.
+
+### CLI files
+
+`send`, `note`, and `finish --file PATH` read the file on the **client** and
+stream its contents to the host. `--stdin` works too. `new --cwd`,
+`new --file` (a live document viewer), and `wait --artifact` use **host** paths.
+`pad --cat` and `wait --cat` return the host's scratchpad contents.
+
+The mac bundle installer links `~/.local/bin/seance` to the installed app,
+and updates the legacy `~/.cargo/bin/seance` link if it points at this repo's
+build. Use `--cli-dir DIR` to choose a different CLI directory. Add that
+directory to PATH if your shell doesn't include it.
+
+`./scripts/bundle-macos.sh --with-skills` also installs the bundled
+`seance-control` skill into `~/.agents/skills` (ChatGPT desktop/Codex) and
+`~/.claude/skills`. Use **work locally** in ChatGPT and start a new task to
+pick up the skill. The skill uses the local CLI; the saved host stays an
+implementation detail.
+
+## Version gate
+
+The daemon strictly refuses `ctl`/`gui` hellos whose `build` doesn't match
+its own `CARGO_PKG_VERSION` — cross-machine version skew fails loudly instead
+of corrupting the protocol. Upgrade the older side (`cargo build --release &&
+seance upgrade` on the daemon host; redeploy the client binary elsewhere).
+`handoff`/`upgrade` roles are exempt (upgrades cross versions by design).
+
+**Where the refusal shows up.** The GUI asks before it opens a window
+(`gui_client::preflight`, a `ctl` hello + one `whoami`): a refusal goes to the
+launch picker with the daemon's own text. If the daemon is upgraded under a
+*live* thin client, the refusal arrives mid-session instead and the window
+carries a sticky ⚠ bar until it reattaches. Both say the same thing the daemon
+said, which names the fix. (Before 0.25.5 neither did — the client read the
+refusal into `gui.stderr.log` and reconnected forever behind an empty rail.
+A mac stuck on 0.24.0 that way looked exactly like a daemon with no circles.)
+
+**Redeploying the client.** The client is built on the client machine, so
+"upgrade the mac" is a pull and a bundle:
+
+```bash
+ssh <mac> 'cd ~/work/seance && git pull --ff-only && ./scripts/bundle-macos.sh'
+```
+
+Then quit and relaunch the app — an already-running GUI keeps the binary it
+started with. Deploy the client *after* the daemon host, never before: a client
+ahead of its daemon is the same refusal in the other direction.
+
+## Everything comes from the daemon
+
+The fs bridge (`GuiRequest::Fs` / `daemon::fsbridge`) serves the GUI:
+
+| Surface | Mechanism |
+|---|---|
+| file panes | `FsOp::Read/Write/Stat/List/Remove` (daemon paths) |
+| scratchpads | pad path from `PaneInfo.scratchpad` + fs ops |
+| layout (split/weights) | `FsOp::LayoutLoad/LayoutSave` → daemon state dir — all windows share tiling |
+| notes face (which pane is flipped) | part of the rail arrangement (`SubscriptionsPref.flipped`) — restored on boot, pushed to every window |
+| host widgets (claude chips) | polled daemon-side, pushed as `HostWidgets`; select runs daemon-side (`FsOp::HostSelect`) |
+
+Bridge ops execute on their own daemon thread (never the input path) and are
+correlated by id; replies route to the waiting caller inside `gui_client`,
+not the app event stream.
+
+## macOS
+
+The GUI builds and runs on macOS (gpui is zed's framework; the pinned revs
+compile on darwin). Platform notes: `open` instead of `xdg-open`, `ps`
+instead of `/proc`, `libc::getuid()` for the socket suffix. Build the same
+way as Linux (`scripts/bootstrap-deps.sh` symlinks `deps/zed`, then
+`cargo build --release`).
+- **keys:** every `ctrl+shift+<key>` chord also answers to `cmd+shift+<key>`
+  here (0.25.5), and `cmd+c` / `cmd+v` copy and paste without shift. Ctrl still
+  works. Exception: macOS takes `cmd+shift+3/4/5` for screenshots before the app
+  sees them — use `ctrl+shift` for those rail rows.
+  A mac keyboard has no page keys, so `cmd+up`/`cmd+down` stand in for
+  `ctrl+pgup`/`pgdn` (cycle circles) and `cmd+shift+up`/`down` for the pane
+  cycle (0.25.6). Spatial pane nav therefore stays on `ctrl+shift+arrows` —
+  cmd+shift+left/right still reach it too.
+- `seance ctl new --agent <agent>` uses the host's agent profile when routed
+  through the saved connection. An explicit `SEANCE_SOCKET` bypasses that
+  routing and retains direct-socket CLI behavior, including local profile lookup.
+
+## Workspaces on a second machine
+
+A thin-client window follows the normal multi-window model: nothing is owned,
+and every window subscribes to every circle (0.26 — the park verb is gone).
+**The arrangement itself — spaces, pins — is daemon-owned as of 0.23**, so a mac
+window opens on the same rail as the desk, with the same spaces and pins.
+Move a circle here and it moves there; the daemon pushes the
+change to every attached window (`~/.local/share/seance/subscriptions.json`
+on the daemon host, beside `layout.json`).
+
+The same circle can be live here and at the desk simultaneously — sessions
+never move or restart, only which windows render them.
+
+`~/.config/seance/subscriptions.json` still exists on each client, demoted to
+a seed cache: it's what `Attach` opens on before the daemon answers, so a
+window doesn't attach to all 47 circles and unsubscribe 35 of them a beat
+later. The daemon's copy wins any disagreement.

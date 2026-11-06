@@ -1,0 +1,1503 @@
+//! Client-side session state: the single store every module reads.
+//!
+//! [`ClientState::apply_event`] folds daemon pushes into the store and reports
+//! what changed as a [`Applied`] so the caller repaints exactly what's dirty —
+//! grid frames repaint one canvas, structure changes rebuild chrome.
+
+use std::collections::HashMap;
+
+use base64::Engine as _;
+use seance_core::protocol::{AskInfo, GuiEvent, PaneInfo, StatusInfo, WindowInfo};
+use seance_core::snapshot::{decode_grid_bin_onto, GridSnapshot};
+
+use crate::subs::SubPrefs;
+
+/// What a folded event dirtied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Applied {
+    /// Nothing a renderer cares about (Pong, FsResult handled elsewhere, …).
+    Nothing,
+    /// One pane's grid changed → repaint that canvas only.
+    Grid { pane: String },
+    /// A grid frame could not be applied (damage desync) → send RefreshGrid.
+    NeedRefresh { pane: String },
+    /// Pane list / workspace structure / focus changed → rebuild chrome.
+    Structure,
+    /// Asks or statuses changed → refresh badges/ask UI.
+    Badges,
+    /// Daemon error message to surface.
+    Error { message: String },
+    /// This window was remote-closed (✦ popover) — stop reconnecting.
+    Kicked { by: String },
+    /// The shared rail arrangement changed in some window. Carries the raw blob;
+    /// adopting it needs the app (localStorage + Subscribe), not just state.
+    RailPrefs { json: String },
+}
+
+/// Per-pane co-presence state (from Agency events).
+#[derive(Clone, Debug, Default)]
+pub struct AgencyState {
+    pub owner: String,
+    pub drive_mode: String,
+    pub human_idle: bool,
+    pub exited: bool,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Default)]
+pub struct ClientState {
+    pub panes: Vec<PaneInfo>,
+    pub grids: HashMap<String, GridSnapshot>,
+    pub selected_workspace: Option<String>,
+    pub focused_pane: Option<String>,
+    pub extra_workspaces: Vec<String>,
+    pub workspace_order: Vec<String>,
+    pub asks: Vec<AskInfo>,
+    pub statuses: HashMap<String, StatusInfo>,
+    pub agency: HashMap<String, AgencyState>,
+    pub window_id: Option<String>,
+    pub windows: Vec<WindowInfo>,
+    /// This connection's subscription set (daemon order). State arrives and is
+    /// KEPT global — every circle, every pane.
+    pub subscriptions: Vec<String>,
+    /// Per-GUI rail prefs: pins, folds, seen (localStorage; see [`crate::subs`]).
+    pub subs: SubPrefs,
+    /// Set when a fold changed [`subs`] — the app persists and clears it.
+    pub subs_dirty: bool,
+    /// Who last wrote stdin per pane (`human` / `agent:x` / `cli` / `propose`).
+    pub input_origin: HashMap<String, String>,
+    /// Monotonic revision bumped on every Structure-level change.
+    pub structure_rev: u64,
+    /// Host-bridge widgets (claude accounts strip) — daemon-polled, pushed on
+    /// attach + every poll tick.
+    pub host_widgets: Vec<HostWidget>,
+    /// Client-local: last human-touch ms per workspace (sidebar auto-sort key;
+    /// mirrors the native app — selecting alone does NOT bump).
+    pub workspace_touch: HashMap<String, f64>,
+    /// Sticky unread attention per non-selected workspace (cleared on select).
+    pub workspace_unread: HashMap<String, Attention>,
+    /// Workspaces observed live-working last check (finish detection).
+    pub workspace_was_working: std::collections::HashSet<String>,
+    /// Frame clock (perf-now domain), refreshed by `sync_working_touches` once
+    /// per frame. The sort runs after that call and needs a `now` to age the
+    /// output clocks against; threading one through the comparator isn't
+    /// worth it.
+    pub frame_now_ms: f64,
+    /// Client-local zoomed pane (fills the tile area; esc restores).
+    pub zoomed: Option<String>,
+    /// Recent activity (Touch/status/spawn/kill/ask), newest last, capped.
+    pub activity: std::collections::VecDeque<ActivityItem>,
+    /// Slug of the most recent PaneSpawned (summon's rename-on-arrival hook).
+    pub last_spawned: Option<String>,
+    /// Last pane output per workspace (ms) — sidebar shows time-since-update.
+    pub workspace_activity: HashMap<String, f64>,
+    /// Per-pane deadline until which grid content changes count as resize
+    /// reflow, not output. Armed by any frame that arrives at new dims.
+    pub resize_settle: HashMap<String, f64>,
+    /// slug → display label, mirrored from `WorkspaceMeta.name`. A circle's
+    /// slug is its identity; nothing here is keyed by the label, so a rename
+    /// disturbs none of it — including the localStorage rail prefs.
+    pub workspace_names: HashMap<String, String>,
+    /// Host circle modes (`host.json` `circle_modes[]`, e.g. AFK), as the
+    /// daemon advertises them. Empty when the host defines none — then the
+    /// whole feature is invisible.
+    pub circle_mode_defs: Vec<seance_core::protocol::CircleModeDef>,
+    /// slug → ids of the circle modes it is in (`WorkspaceMeta.modes`).
+    pub circle_modes: HashMap<String, Vec<String>>,
+    /// `Date.now() - performance.now()` at boot. Both local clocks above live
+    /// in the `performance.now()` domain; the daemon's are unix ms, so every
+    /// ingested daemon stamp is converted with `perf = unix - offset`. Set
+    /// once by `lib.rs`; tests leave it at 0 so conversion is identity.
+    pub clock_offset_ms: f64,
+    /// When each name the rail arrangement references went missing from the
+    /// daemon's world (perf-now ms). Feeds `settle_absent`, which is what
+    /// keeps a quicklaunch pin alive across the `State` that lands before its
+    /// spawn does.
+    pub absent_since: HashMap<String, u64>,
+    /// Space whose circles the rail lists (None → the selected circle's).
+    pub rail_space: Option<String>,
+    pub rail_filter: RailFilter,
+    /// Space assignments changed on reconcile — shared state, so it goes to
+    /// the daemon (unlike `subs_dirty`, which is local bookkeeping).
+    pub spaces_dirty: bool,
+}
+
+/// What the rail's circle list is narrowed to (native `RailFilter`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RailFilter {
+    #[default]
+    All,
+    Starred,
+    Mode(String),
+}
+
+/// One row of the host-bridge widget strip (native `HostWidgetSnap` shape).
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct HostWidget {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub items: Vec<HostItem>,
+    #[serde(default)]
+    pub active: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct HostItem {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub detail2: String,
+    #[serde(default)]
+    pub selected: bool,
+}
+
+/// Sidebar badge for a workspace (native `WorkspaceAttention` mirror).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attention {
+    Working,
+    NeedsHuman,
+    Done,
+}
+
+impl Attention {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::NeedsHuman => "needs",
+            Self::Done => "done",
+        }
+    }
+    pub fn priority(self) -> u8 {
+        match self {
+            Self::NeedsHuman => 3,
+            Self::Working => 2,
+            Self::Done => 1,
+        }
+    }
+}
+
+/// One line of the activity drawer.
+#[derive(Clone, Debug)]
+pub struct ActivityItem {
+    /// performance.now-ish ms stamped by the caller via [`ClientState::note_activity`].
+    pub at_ms: f64,
+    pub actor: String,
+    pub pane: Option<String>,
+    pub text: String,
+}
+
+const ACTIVITY_CAP: usize = 200;
+
+/// Grace after a frame arrives at new dims: the SIGWINCH redraw that follows
+/// the resize we requested is reflow, not output. Mirrors the native const.
+const RESIZE_SETTLE_MS: f64 = 400.0;
+
+/// Coarse one-unit relative time for sidebar labels ("now","42s","3m","2h","4d").
+pub fn rel_label(delta_ms: f64) -> String {
+    let s = (delta_ms / 1000.0).max(0.0) as u64;
+    match s {
+        0..=4 => "now".into(),
+        5..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86_399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
+}
+
+use seance_core::util::recency_rank;
+/// Busy TUI title: braille spinner (U+2800..=U+28FF) as first non-space char.
+/// One detector, shared with the daemon — which is the only party that sees
+/// every pane's title (see [`ClientState::pane_is_live_working`]).
+pub use seance_core::util::title_looks_busy;
+
+impl ClientState {
+    /// All workspaces in sidebar display order — the native auto-sort:
+    /// 1. circles with an actively working agent float to the top;
+    /// 2. within/outside that band, most recent human *touch* first
+    ///    (typing into the circle, context-menu touch, fresh spawn —
+    ///    selecting alone does not bump);
+    /// 3. name as the stable tiebreak.
+    pub fn workspaces(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let seen = |out: &mut Vec<String>, name: &str| {
+            if !out.iter().any(|w| w == name) {
+                out.push(name.to_string());
+            }
+        };
+        for w in &self.workspace_order {
+            seen(&mut out, w);
+        }
+        for p in &self.panes {
+            seen(&mut out, &p.workspace);
+        }
+        for w in &self.extra_workspaces {
+            seen(&mut out, w);
+        }
+        if let Some(sel) = &self.selected_workspace {
+            seen(&mut out, sel);
+        }
+        out.sort_by(|a, b| {
+            let key = |ws: &str| {
+                let band = if self.workspace_has_working_agent(ws) {
+                    0u8
+                } else {
+                    1
+                };
+                // Idle band ranks by the age the row DISPLAYS, not the raw
+                // clock — see native `recency_rank`. A TUI repainting on a
+                // timer otherwise reorders the list forever.
+                let rank = if band == 0 {
+                    0
+                } else {
+                    let at = self
+                        .workspace_activity
+                        .get(ws)
+                        .copied()
+                        .unwrap_or(f64::MIN)
+                        .max(self.workspace_touch.get(ws).copied().unwrap_or(f64::MIN));
+                    if at <= f64::MIN {
+                        u64::MAX
+                    } else {
+                        recency_rank((self.frame_now_ms - at).max(0.0) as u64)
+                    }
+                };
+                (band, rank, ws.to_lowercase())
+            };
+            key(a).cmp(&key(b)).then_with(|| a.cmp(b))
+        });
+        out
+    }
+
+    /// Sidebar main list. Ctrl+PageUp/Down cycles exactly this.
+    pub fn active_workspaces(&self) -> Vec<String> {
+        self.workspaces()
+    }
+
+    /// The pinned section, rendered ABOVE everything else in the sidebar, with
+    /// the same working/idle sort applied within it (pins reorder among
+    /// themselves, they don't freeze).
+    pub fn pinned_workspaces(&self) -> Vec<String> {
+        self.workspaces()
+            .into_iter()
+            .filter(|w| self.subs.is_pinned(w))
+            .collect()
+    }
+
+    /// The normal band under the pinned section.
+    pub fn unpinned_active_workspaces(&self) -> Vec<String> {
+        self.workspaces()
+            .into_iter()
+            .filter(|w| !self.subs.is_pinned(w))
+            .collect()
+    }
+
+    /// Row badge. The rail has no `needs` state (removed 0.27, native twin).
+    pub fn row_attention(&self, ws: &str) -> Option<Attention> {
+        self.workspace_attention(ws)
+    }
+
+    /// Live-busy as the DAEMON sees it: braille title spinner, or agent-driven
+    /// working status (human-owned sticky "working" is ignored — stale inject
+    /// chrome).
+    ///
+    /// The spinner half reads `PaneInfo::busy`, not the local grid title: grid
+    /// frames only arrive for the selected workspace, so every other circle's
+    /// title is frozen at whatever it wore when you looked away. The daemon
+    /// broadcasts busy flips for every pane (`GuiEvent::PaneBusy`).
+    pub fn pane_is_live_working(&self, slug: &str) -> bool {
+        if self.pane(slug).is_some_and(|p| p.busy) {
+            return true;
+        }
+        let owner = self.agency.get(slug).map(|a| a.owner.as_str());
+        match (owner, self.statuses.get(slug).map(|s| s.state.as_str())) {
+            (Some("human"), Some("working" | "planning")) => false,
+            (_, Some("working" | "planning")) => true,
+            _ => false,
+        }
+    }
+
+    /// ONLY the title spinner, which in practice means claude. Output recency
+    /// is not a substitute: codex repaints on a timer so its clock never goes
+    /// stale, and it puts no working state in its title. Mirrors native
+    /// `workspace_has_working_agent`.
+    pub fn workspace_has_working_agent(&self, workspace: &str) -> bool {
+        self.panes
+            .iter()
+            .any(|p| p.workspace == workspace && self.pane_is_live_working(&p.slug))
+    }
+
+    /// Live attention badge for a sidebar row (native `workspace_attention_cx`).
+    pub fn workspace_attention(&self, workspace: &str) -> Option<Attention> {
+        if self.workspace_has_working_agent(workspace) {
+            return Some(Attention::Working);
+        }
+        self.workspace_unread.get(workspace).copied()
+    }
+
+    /// Ctrl+PageUp/Down walks EXACTLY what the sidebar displays, read live at
+    /// each press (owner decision 2026-08-02; native mirrors). Folded bands
+    /// and clusters are not displayed, so they are not in the ring — folding
+    /// a pile is how you narrow the rotation to what you're working in.
+    pub fn displayed_active_ring(&self) -> Vec<String> {
+        self.visible_workspaces()
+    }
+
+    /// Bump recency (human typing here / fresh spawn).
+    /// Optimistic flip of a circle mode, ahead of the daemon's State echo.
+    pub fn set_circle_mode_local(&mut self, ws: &str, mode: &str, on: bool) {
+        let ids = self.circle_modes.entry(ws.to_string()).or_default();
+        ids.retain(|m| m != mode);
+        if on {
+            ids.push(mode.to_string());
+        }
+        if ids.is_empty() {
+            self.circle_modes.remove(ws);
+        }
+        self.structure_rev += 1;
+    }
+
+    /// The defs of the modes `ws` is currently in, in host order.
+    pub fn circle_modes_of(&self, ws: &str) -> Vec<seance_core::protocol::CircleModeDef> {
+        let on = self.circle_modes.get(ws);
+        self.circle_mode_defs
+            .iter()
+            .filter(|d| on.is_some_and(|ids| ids.contains(&d.id)))
+            .cloned()
+            .collect()
+    }
+
+    /// The space the rail is showing: picked, else the selected circle's,
+    /// else the default.
+    pub fn current_space(&self) -> String {
+        let spaces = &self.subs.spaces;
+        if let Some(id) = self.rail_space.as_deref() {
+            if spaces.get(id).is_some() {
+                return id.to_string();
+            }
+        }
+        match self.selected_workspace.as_deref() {
+            Some(ws) => spaces.space_of(ws).to_string(),
+            None => spaces.default_id().to_string(),
+        }
+    }
+
+    pub fn rail_filter_matches(&self, filter: &RailFilter, ws: &str) -> bool {
+        match filter {
+            RailFilter::All => true,
+            RailFilter::Starred => self.subs.is_pinned(ws),
+            RailFilter::Mode(id) => self
+                .circle_modes
+                .get(ws)
+                .is_some_and(|m| m.iter().any(|x| x == id)),
+        }
+    }
+
+    /// Every circle the rail is listing, in draw order — the ctrl+page ring.
+    /// Unfiltered: the current space. Filtered: matches from every space.
+    pub fn visible_workspaces(&self) -> Vec<String> {
+        let ordered = self.workspaces();
+        let spaces = &self.subs.spaces;
+        match &self.rail_filter {
+            RailFilter::All => spaces.circles_in(&self.current_space(), &ordered),
+            f => spaces
+                .list
+                .iter()
+                .flat_map(|s| spaces.circles_in(&s.id, &ordered))
+                .filter(|ws| self.rail_filter_matches(f, ws))
+                .collect(),
+        }
+    }
+
+    /// Strongest attention among a space's circles.
+    pub fn space_attention(&self, id: &str) -> Option<Attention> {
+        let ordered = self.workspaces();
+        self.subs
+            .spaces
+            .circles_in(id, &ordered)
+            .iter()
+            .filter_map(|ws| self.row_attention(ws))
+            .max_by_key(|a| a.priority())
+    }
+
+    /// What to show for a circle: its label, falling back to its slug — which
+    /// is what every circle reads as until someone renames it.
+    pub fn workspace_label(&self, ws: &str) -> String {
+        self.workspace_names
+            .get(ws)
+            .cloned()
+            .unwrap_or_else(|| ws.to_string())
+    }
+
+    /// Any pane of this circle is asleep — the circle reads as asleep.
+    pub fn workspace_asleep(&self, ws: &str) -> bool {
+        self.panes.iter().any(|p| p.workspace == ws && p.asleep)
+    }
+
+    /// Every pane can be put back exactly (daemon's `PaneInfo::restorable` —
+    /// it needs the filesystem, so the client can't decide it). Gates "sleep".
+    pub fn workspace_sleepable(&self, ws: &str) -> bool {
+        let mut any = false;
+        for p in self.panes.iter().filter(|p| p.workspace == ws) {
+            any = true;
+            if !p.restorable {
+                return false;
+            }
+        }
+        any
+    }
+
+    pub fn touch_workspace(&mut self, ws: &str, now_ms: f64) {
+        if !ws.is_empty() {
+            self.workspace_touch.insert(ws.to_string(), now_ms);
+        }
+    }
+
+    /// Finish detection: a circle that stops working gets a touch so it lands
+    /// at the top of the idle band (freshly finished work is what you want
+    /// next). Call once per frame; cheap.
+    pub fn sync_working_touches(&mut self, now_ms: f64) {
+        // Also the frame clock the idle-band ranking ages against.
+        self.frame_now_ms = now_ms;
+        let names = self.workspaces();
+        for ws in names {
+            let now_working = self.workspace_has_working_agent(&ws);
+            // No touch bump on the falling edge — working is keyed off output
+            // recency now, so a circle that just went quiet already holds the
+            // freshest clock in the idle band and lands at the top by itself.
+            if now_working {
+                self.workspace_was_working.insert(ws);
+            } else {
+                self.workspace_was_working.remove(&ws);
+            }
+        }
+    }
+
+    /// Daemon unix-ms stamp → local `performance.now()` domain.
+    fn to_perf(&self, unix_ms: u64) -> f64 {
+        unix_ms as f64 - self.clock_offset_ms
+    }
+
+    /// MAX-merge a daemon output clock into the local mirror.
+    fn merge_activity(&mut self, ws: &str, unix_ms: u64) {
+        if unix_ms == 0 || ws.is_empty() {
+            return;
+        }
+        let t = self.to_perf(unix_ms);
+        let cur = self.workspace_activity.get(ws).copied().unwrap_or(f64::MIN);
+        if t > cur {
+            self.workspace_activity.insert(ws.to_string(), t);
+        }
+    }
+
+    /// MAX-merge a daemon touch clock into the local mirror.
+    fn merge_touch(&mut self, ws: &str, unix_ms: u64) {
+        if unix_ms == 0 || ws.is_empty() {
+            return;
+        }
+        let t = self.to_perf(unix_ms);
+        let cur = self.workspace_touch.get(ws).copied().unwrap_or(f64::MIN);
+        if t > cur {
+            self.workspace_touch.insert(ws.to_string(), t);
+        }
+    }
+
+    /// Does this incoming frame count as real output for the activity clock?
+    ///
+    /// Mirrors the native rule (`app::util::grid_frame_is_output`): first
+    /// paint isn't output, a dimension change is reflow (and arms the settle
+    /// window), and the redraw burst the PTY emits after the resize WE asked
+    /// for — the first time a circle's tiles are sized — is reflow too.
+    /// Selecting a circle must never bump its last-active time.
+    fn grid_frame_is_output(&mut self, pane: &str, snap: &GridSnapshot, now_ms: f64) -> bool {
+        let Some(prev) = self.grids.get(pane) else {
+            return false;
+        };
+        let prev_empty = prev.cells.is_empty();
+        let dims_match = prev.cols == snap.cols && prev.rows == snap.rows;
+        let cells_changed = prev.cells != snap.cells;
+        if !dims_match {
+            self.resize_settle
+                .insert(pane.to_string(), now_ms + RESIZE_SETTLE_MS);
+        }
+        if prev_empty || !dims_match || !cells_changed {
+            return false;
+        }
+        if self
+            .resize_settle
+            .get(pane)
+            .is_some_and(|until| now_ms < *until)
+        {
+            return false;
+        }
+        self.resize_settle.remove(pane);
+        true
+    }
+
+    fn note_pane_output(&mut self, slug: &str, now_ms: f64) {
+        if let Some(ws) = self.pane(slug).map(|p| p.workspace.clone()) {
+            self.workspace_activity.insert(ws, now_ms);
+        }
+    }
+
+    /// Sidebar right-edge label: time since last pane output; empty while a
+    /// working spinner owns the slot or before any output was observed.
+    pub fn activity_label(&self, ws: &str, now_ms: f64) -> String {
+        if self.workspace_has_working_agent(ws) {
+            return String::new();
+        }
+        match self.workspace_activity.get(ws) {
+            Some(at) => rel_label(now_ms - at),
+            None => String::new(),
+        }
+    }
+
+    /// Local select bookkeeping: clear sticky unread for the circle.
+    pub fn note_selected(&mut self, ws: &str) {
+        self.workspace_unread.remove(ws);
+    }
+
+    pub fn note_activity(&mut self, at_ms: f64, actor: &str, pane: Option<&str>, text: String) {
+        self.activity.push_back(ActivityItem {
+            at_ms,
+            actor: actor.to_string(),
+            pane: pane.map(str::to_string),
+            text,
+        });
+        while self.activity.len() > ACTIVITY_CAP {
+            self.activity.pop_front();
+        }
+    }
+
+    /// Sticky unread bookkeeping for a status event on a non-selected circle
+    /// (native `note_workspace_status_event`).
+    fn note_status_attention(&mut self, slug: &str, state: &str) {
+        let Some(ws) = self.pane(slug).map(|p| p.workspace.clone()) else {
+            return;
+        };
+        if self.selected_workspace.as_deref() == Some(ws.as_str()) {
+            self.workspace_unread.remove(&ws);
+            return;
+        }
+        let att = match state {
+            "done" => Some(Attention::Done),
+            "working" | "planning" => Some(Attention::Working),
+            _ => None,
+        };
+        if let Some(a) = att {
+            let cur = self.workspace_unread.get(&ws).copied();
+            if cur.map(|c| a.priority() > c.priority()).unwrap_or(true) {
+                self.workspace_unread.insert(ws, a);
+            }
+        }
+    }
+
+    /// Tiled panes in one workspace, list order (the daemon's persistence key).
+    pub fn panes_in(&self, workspace: &str) -> Vec<&PaneInfo> {
+        self.panes
+            .iter()
+            .filter(|p| p.workspace == workspace)
+            .collect()
+    }
+
+    pub fn pane(&self, slug: &str) -> Option<&PaneInfo> {
+        self.panes.iter().find(|p| p.slug == slug)
+    }
+
+    pub fn focused_pane_in(&self, workspace: &str) -> Option<&PaneInfo> {
+        let mut panes = self
+            .panes
+            .iter()
+            .filter(|p| p.workspace == workspace && p.tiled);
+        panes
+            .clone()
+            .find(|p| self.focused_pane.as_deref() == Some(&p.slug))
+            .or_else(|| panes.next())
+    }
+
+    /// Fold one daemon event into the store. `now_ms` stamps activity rows
+    /// and touch bumps (pass `performance.now()`; tests pass 0).
+    pub fn apply_event(&mut self, ev: GuiEvent, now_ms: f64) -> Applied {
+        match ev {
+            GuiEvent::State {
+                panes,
+                selected_workspace,
+                focused_pane,
+                extra_workspaces,
+                workspace_order,
+                asks,
+                statuses,
+                window_id,
+                windows,
+                subscriptions,
+                workspace_meta,
+                circle_modes,
+            } => {
+                // State is global from 0.12 and STAYS global — nothing is
+                // dropped at ingest.
+                // Drop grids for panes that no longer exist (reattach after
+                // daemon restart must not paint ghosts).
+                let live: std::collections::HashSet<String> =
+                    panes.iter().map(|p| p.slug.clone()).collect();
+                self.grids.retain(|slug, _| live.contains(slug));
+                self.panes = panes;
+                self.selected_workspace = selected_workspace;
+                self.focused_pane = focused_pane;
+                self.extra_workspaces = extra_workspaces;
+                self.workspace_order = workspace_order;
+                self.asks = asks;
+                self.statuses = statuses
+                    .into_iter()
+                    .filter(|s| live.contains(&s.slug))
+                    .map(|s| (s.slug.clone(), s))
+                    .collect();
+                self.window_id = window_id;
+                self.windows = windows;
+                self.subscriptions = subscriptions;
+                // Daemon-owned clocks are the durable copy — mirror them
+                // (converted to the perf domain, max-merged so a local stamp
+                // from a frame we already painted is never walked back).
+                // Labels arrive for every known circle, so rebuild wholesale:
+                // a circle renamed back to its slug must lose its entry.
+                self.workspace_names.clear();
+                self.circle_mode_defs = circle_modes;
+                self.circle_modes.clear();
+                for m in workspace_meta {
+                    if !m.modes.is_empty() {
+                        self.circle_modes
+                            .insert(m.workspace.clone(), m.modes.clone());
+                    }
+                    self.merge_activity(&m.workspace, m.last_output_ms);
+                    self.merge_touch(&m.workspace, m.last_touch_ms);
+                    if let Some(n) = m.name.clone() {
+                        self.workspace_names.insert(m.workspace.clone(), n);
+                    }
+                }
+                // Rail bookkeeping: first State marks everything known as
+                // looked-at, every State prunes circles that are gone.
+                let known = self.workspaces();
+                let mut space_circles: Vec<String> = known.clone();
+                if self.subs.seeded {
+                    // Prune against what the daemon knows PLUS anything only
+                    // recently missing: quicklaunch pins the circle the
+                    // instant you press the button, and the `State` that
+                    // crosses the spawn on the wire carries no such circle.
+                    // Pruning straight against `known` there pinned it and
+                    // then silently unpinned it (native twin: `settle_absent`
+                    // in app/workspaces.rs, fixed first in 0.26.0).
+                    let referenced: Vec<String> = self
+                        .subs
+                        .pinned
+                        .iter()
+                        .chain(self.subs.seen.iter())
+                        .chain(self.subs.spaces.of.keys())
+                        .cloned()
+                        .collect();
+                    let known_set: std::collections::BTreeSet<String> =
+                        known.iter().cloned().collect();
+                    let protected: Vec<String> = seance_core::util::settle_absent(
+                        &mut self.absent_since,
+                        referenced.iter().map(String::as_str),
+                        &known_set,
+                        now_ms as u64,
+                    )
+                    .into_iter()
+                    .collect();
+                    self.subs_dirty |= self.subs.reconcile(&protected);
+                    space_circles = protected;
+                } else {
+                    self.subs.seed(&known);
+                    self.subs_dirty = true;
+                }
+                // Space bookkeeping covers recently-absent circles too, so a
+                // State that lags a spawn doesn't forget where one lives.
+                let circles: Vec<(String, String)> = space_circles
+                    .into_iter()
+                    .map(|ws| {
+                        let label = self.workspace_label(&ws);
+                        (ws, label)
+                    })
+                    .collect();
+                let focused = self.current_space();
+                self.spaces_dirty |= self.subs.spaces.reconcile(&circles, Some(&focused));
+                // Freeze the view once the selection has a space (native twin).
+                if self.rail_space.is_none() {
+                    if let Some(sel) = self.selected_workspace.as_deref() {
+                        if self.subs.spaces.of.contains_key(sel) {
+                            self.rail_space = Some(self.subs.spaces.space_of(sel).to_string());
+                        }
+                    }
+                }
+                self.structure_rev += 1;
+                Applied::Structure
+            }
+            GuiEvent::Grid(snap) => {
+                let pane = snap.pane.clone();
+                let changed = self.grid_frame_is_output(&pane, &snap, now_ms);
+                self.grids.insert(pane.clone(), snap);
+                if changed {
+                    self.note_pane_output(&pane, now_ms);
+                }
+                Applied::Grid { pane }
+            }
+            GuiEvent::GridBin { pane, data_b64, .. } => {
+                let data = match base64::engine::general_purpose::STANDARD.decode(&data_b64) {
+                    Ok(d) => d,
+                    Err(_) => return Applied::NeedRefresh { pane },
+                };
+                let base = self.grids.get(&pane);
+                match decode_grid_bin_onto(&data, base) {
+                    Ok(snap) => {
+                        // Stamp only real content change — full re-pushes on
+                        // attach/pull must not reset the activity clock.
+                        let changed = self.grid_frame_is_output(&pane, &snap, now_ms);
+                        self.grids.insert(pane.clone(), snap);
+                        if changed {
+                            self.note_pane_output(&pane, now_ms);
+                        }
+                        Applied::Grid { pane }
+                    }
+                    Err(_) => Applied::NeedRefresh { pane },
+                }
+            }
+            GuiEvent::PaneSpawned { pane } => {
+                self.last_spawned = Some(pane.slug.clone());
+                self.touch_workspace(&pane.workspace.clone(), now_ms);
+                self.note_activity(
+                    now_ms,
+                    "daemon",
+                    Some(&pane.slug),
+                    format!("pane spawned: {}", pane.name),
+                );
+                if let Some(existing) = self.panes.iter_mut().find(|p| p.slug == pane.slug) {
+                    *existing = pane;
+                } else {
+                    self.panes.push(pane);
+                }
+                self.structure_rev += 1;
+                Applied::Structure
+            }
+            GuiEvent::PaneBusy { pane, busy } => {
+                let flipped = self
+                    .panes
+                    .iter_mut()
+                    .find(|p| p.slug == pane)
+                    .is_some_and(|p| {
+                        let changed = p.busy != busy;
+                        p.busy = busy;
+                        changed
+                    });
+                if flipped {
+                    // Band membership changed → the sidebar re-sorts.
+                    self.structure_rev += 1;
+                    Applied::Structure
+                } else {
+                    Applied::Nothing
+                }
+            }
+            GuiEvent::PaneKilled { slug } => {
+                self.note_activity(now_ms, "daemon", Some(&slug), "pane killed".into());
+                if self.zoomed.as_deref() == Some(slug.as_str()) {
+                    self.zoomed = None;
+                }
+                self.panes.retain(|p| p.slug != slug);
+                self.grids.remove(&slug);
+                self.statuses.remove(&slug);
+                self.agency.remove(&slug);
+                self.structure_rev += 1;
+                Applied::Structure
+            }
+            GuiEvent::PaneExited { slug, exit_code } => {
+                if let Some(p) = self.panes.iter_mut().find(|p| p.slug == slug) {
+                    p.exited = true;
+                    p.exit_code = exit_code;
+                    p.running = false;
+                }
+                self.structure_rev += 1;
+                Applied::Structure
+            }
+            GuiEvent::Ask { ask } => {
+                self.note_activity(now_ms, &ask.from, None, format!("asks: {}", ask.question));
+                if let Some(existing) = self.asks.iter_mut().find(|a| a.id == ask.id) {
+                    *existing = ask;
+                } else {
+                    self.asks.push(ask);
+                }
+                Applied::Badges
+            }
+            GuiEvent::AskResolved { id } => {
+                self.asks.retain(|a| a.id != id);
+                Applied::Badges
+            }
+            GuiEvent::Status { slug, state, note } => {
+                self.note_status_attention(&slug, &state);
+                self.note_activity(
+                    now_ms,
+                    "agent",
+                    Some(&slug),
+                    match &note {
+                        Some(n) => format!("status: {state} — {n}"),
+                        None => format!("status: {state}"),
+                    },
+                );
+                let entry = self.statuses.entry(slug.clone()).or_insert(StatusInfo {
+                    slug: slug.clone(),
+                    state: String::new(),
+                    note: None,
+                    pad_rev: 0,
+                });
+                entry.state = state;
+                entry.note = note;
+                Applied::Badges
+            }
+            GuiEvent::Touch { slug, verb, actor } => {
+                self.note_activity(now_ms, &actor, Some(&slug), verb);
+                Applied::Badges
+            }
+            GuiEvent::InputOrigin { pane, origin } => {
+                self.input_origin.insert(pane, origin);
+                Applied::Badges
+            }
+            GuiEvent::Agency {
+                pane,
+                owner,
+                drive_mode,
+                human_idle,
+                exited,
+                exit_code,
+            } => {
+                self.agency.insert(
+                    pane,
+                    AgencyState {
+                        owner,
+                        drive_mode,
+                        human_idle,
+                        exited,
+                        exit_code,
+                    },
+                );
+                Applied::Badges
+            }
+            GuiEvent::Ghost { pane, ghost } => {
+                if let Some(g) = self.grids.get_mut(&pane) {
+                    g.ghost = ghost;
+                    Applied::Grid { pane }
+                } else {
+                    Applied::Nothing
+                }
+            }
+            GuiEvent::Activity {
+                workspace,
+                last_output_ms,
+            } => {
+                self.merge_activity(&workspace, last_output_ms);
+                Applied::Badges
+            }
+            GuiEvent::Error { message } => Applied::Error { message },
+            GuiEvent::Kicked { by } => Applied::Kicked { by },
+            GuiEvent::Ack { .. } | GuiEvent::FsResult { .. } => Applied::Nothing,
+            // Sound, desktop notifications and clipboard are native-client only.
+            GuiEvent::PaneAlert { .. } | GuiEvent::PaneClipboard { .. } => Applied::Nothing,
+            // The daemon owns the arrangement and broadcasts it to every window
+            // (see subscriptions_pref.rs). Dropping it here is why a pin made at
+            // the desk never showed up in the browser: the pinned band existed
+            // but its membership only ever came from this browser's localStorage.
+            GuiEvent::RailPrefs { json } => Applied::RailPrefs { json: json.clone() },
+            GuiEvent::HostWidgets { widgets } => {
+                if let Ok(parsed) = serde_json::from_value::<Vec<HostWidget>>(widgets) {
+                    self.host_widgets = parsed;
+                }
+                Applied::Badges
+            }
+            GuiEvent::Pong => Applied::Nothing,
+            // Native-only for now: web chrome stays candlelit, though cell
+            // colors (resolved by the daemon) follow the scheme.
+            GuiEvent::Theme { .. } => Applied::Nothing,
+            // The phone has one layout; `ctl layout` is for desktop windows.
+            GuiEvent::View { .. } => Applied::Nothing,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seance_core::snapshot::encode_grid_bin;
+
+    fn state_event() -> GuiEvent {
+        serde_json::from_str(
+            r#"{"event":"state","panes":[{"kind":"term","name":"w","slug":"w-1",
+                "workspace":"lab","command":"bash","cwd":"/","tiled":true,
+                "running":true,"title":null,"scratchpad":"/tmp/p"}],
+                "selected_workspace":"lab","focused_pane":"w-1",
+                "extra_workspaces":[],"workspace_order":["lab"],
+                "asks":[],"statuses":[]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pane_focus_stays_in_circle_and_recovers_when_a_tab_disappears() {
+        let mut st = ClientState::default();
+        st.apply_event(state_event(), 0.0);
+        let mut second = st.panes[0].clone();
+        second.slug = "w-2".into();
+        st.panes.push(second);
+        st.focused_pane = Some("w-2".into());
+        assert_eq!(st.focused_pane_in("lab").unwrap().slug, "w-2");
+        st.panes.retain(|p| p.slug != "w-2");
+        assert_eq!(st.focused_pane_in("lab").unwrap().slug, "w-1");
+        assert!(st.focused_pane_in("empty").is_none());
+        st.panes[0].tiled = false;
+        assert!(st.focused_pane_in("lab").is_none());
+    }
+
+    #[test]
+    fn state_then_grid_bin_applies() {
+        let mut st = ClientState::default();
+        assert_eq!(st.apply_event(state_event(), 0.0), Applied::Structure);
+        assert_eq!(st.workspaces(), vec!["lab".to_string()]);
+
+        let mut snap = GridSnapshot::empty("w-1");
+        snap.rev = 1;
+        let bin = encode_grid_bin(&snap).unwrap();
+        let ev = GuiEvent::GridBin {
+            pane: "w-1".into(),
+            data_b64: base64::engine::general_purpose::STANDARD.encode(bin),
+            seq: 0,
+        };
+        assert_eq!(
+            st.apply_event(ev, 0.0),
+            Applied::Grid { pane: "w-1".into() }
+        );
+        assert_eq!(st.grids.get("w-1").unwrap().rev, 1);
+    }
+
+    #[test]
+    fn damage_without_base_requests_refresh() {
+        let mut st = ClientState::default();
+        let mut snap = GridSnapshot::empty("w-1");
+        snap.rev = 2;
+        snap.cells = vec![seance_core::snapshot::CellSnap::blank(); 80 * 24];
+        let mut next = snap.clone();
+        next.rev = 3;
+        next.cells[0].c = 'x';
+        let dirty = seance_core::snapshot::dirty_rows(&snap.cells, &next.cells, 80, 24);
+        let bin = seance_core::snapshot::encode_grid_bin_ex(&next, Some(&dirty)).unwrap();
+        let ev = GuiEvent::GridBin {
+            pane: "w-1".into(),
+            data_b64: base64::engine::general_purpose::STANDARD.encode(bin),
+            seq: 0,
+        };
+        // No base grid stored → decoder fails → refresh requested.
+        assert_eq!(
+            st.apply_event(ev, 0.0),
+            Applied::NeedRefresh { pane: "w-1".into() }
+        );
+    }
+
+    fn grid_at(cols: u16, rows: u16, first: char) -> GuiEvent {
+        let mut snap = GridSnapshot::empty("w-1");
+        snap.cols = cols;
+        snap.rows = rows;
+        snap.cells = vec![seance_core::snapshot::CellSnap::blank(); cols as usize * rows as usize];
+        snap.cells[0].c = first;
+        GuiEvent::Grid(snap)
+    }
+
+    /// Selecting a circle for the first time lays out its tiles, which sends a
+    /// PTY resize; the redraw that comes back must not bump the activity clock.
+    #[test]
+    fn resize_reflow_redraw_is_not_activity() {
+        let mut st = ClientState::default();
+        st.apply_event(state_event(), 0.0);
+        // First paint at the daemon's stored size — not output.
+        st.apply_event(grid_at(80, 24, 'a'), 1_000.0);
+        assert!(st.workspace_activity.get("lab").is_none());
+        // Our resize lands: new dims → reflow, arms the settle window.
+        st.apply_event(grid_at(120, 40, 'a'), 1_010.0);
+        assert!(st.workspace_activity.get("lab").is_none());
+        // The SIGWINCH redraw: same dims, different cells, inside the window.
+        st.apply_event(grid_at(120, 40, 'b'), 1_050.0);
+        assert!(st.workspace_activity.get("lab").is_none());
+        // Real output after the window → stamps.
+        st.apply_event(grid_at(120, 40, 'c'), 2_000.0);
+        assert_eq!(st.workspace_activity.get("lab"), Some(&2_000.0));
+    }
+
+    /// `state_event` plus one more circle, for the "the spawn landed" half of
+    /// the quicklaunch race.
+    fn state_event_with_extra(ws: &str) -> GuiEvent {
+        serde_json::from_str(&format!(
+            r#"{{"event":"state","panes":[{{"kind":"term","name":"w","slug":"w-1",
+                "workspace":"lab","command":"bash","cwd":"/","tiled":true,
+                "running":true,"title":null,"scratchpad":"/tmp/p"}},
+                {{"kind":"term","name":"x","slug":"x-1",
+                "workspace":"{ws}","command":"bash","cwd":"/","tiled":true,
+                "running":true,"title":null,"scratchpad":"/tmp/x"}}],
+                "selected_workspace":"lab","focused_pane":"w-1",
+                "extra_workspaces":[],"workspace_order":["lab","{ws}"],
+                "asks":[],"statuses":[]}}"#
+        ))
+        .unwrap()
+    }
+
+    fn state_event_with_meta(out_ms: u64, touch_ms: u64) -> GuiEvent {
+        serde_json::from_str(&format!(
+            r#"{{"event":"state","panes":[{{"kind":"term","name":"w","slug":"w-1",
+                "workspace":"lab","command":"bash","cwd":"/","tiled":true,
+                "running":true,"title":null,"scratchpad":"/tmp/p"}}],
+                "selected_workspace":"lab","focused_pane":"w-1",
+                "extra_workspaces":[],"workspace_order":["lab"],
+                "asks":[],"statuses":[],
+                "workspace_meta":[{{"workspace":"lab","last_output_ms":{out_ms},
+                                   "last_touch_ms":{touch_ms}}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_state_without_meta_leaves_clocks_alone() {
+        let mut st = ClientState::default();
+        st.workspace_activity.insert("lab".into(), 500.0);
+        st.apply_event(state_event(), 0.0);
+        assert_eq!(st.workspace_activity.get("lab"), Some(&500.0));
+    }
+
+    #[test]
+    fn daemon_meta_seeds_clocks_and_max_merges() {
+        let mut st = ClientState::default();
+        // offset 0 → unix ms and perf ms are the same numbers in this test.
+        st.apply_event(state_event_with_meta(900, 800), 0.0);
+        assert_eq!(st.workspace_activity.get("lab"), Some(&900.0));
+        assert_eq!(st.workspace_touch.get("lab"), Some(&800.0));
+
+        // An older daemon stamp must never walk a fresher local one back.
+        st.workspace_activity.insert("lab".into(), 1_500.0);
+        st.apply_event(state_event_with_meta(900, 800), 0.0);
+        assert_eq!(st.workspace_activity.get("lab"), Some(&1_500.0));
+
+        // A newer one wins.
+        st.apply_event(state_event_with_meta(2_000, 1_900), 0.0);
+        assert_eq!(st.workspace_activity.get("lab"), Some(&2_000.0));
+        assert_eq!(st.workspace_touch.get("lab"), Some(&1_900.0));
+    }
+
+    #[test]
+    fn zero_clocks_are_unknown_not_epoch() {
+        let mut st = ClientState::default();
+        st.apply_event(state_event_with_meta(0, 0), 0.0);
+        assert!(st.workspace_activity.get("lab").is_none());
+        assert!(st.workspace_touch.get("lab").is_none());
+    }
+
+    #[test]
+    fn activity_event_converts_unix_to_perf_domain() {
+        let mut st = ClientState::default();
+        // Page booted 10_000ms ago at unix 1_700_000_000_000.
+        st.clock_offset_ms = 1_700_000_000_000.0 - 10_000.0;
+        st.apply_event(
+            GuiEvent::Activity {
+                workspace: "lab".into(),
+                last_output_ms: 1_700_000_005_000,
+            },
+            12_000.0,
+        );
+        // unix 1_700_000_005_000 → perf 15_000.
+        assert_eq!(st.workspace_activity.get("lab"), Some(&15_000.0));
+        assert_eq!(st.activity_label("lab", 25_000.0), "10s");
+    }
+
+    /// Two circles, only `lab` subscribed — the 0.12 global State shape.
+    fn global_state_event() -> GuiEvent {
+        serde_json::from_str(
+            r#"{"event":"state","panes":[
+                {"kind":"term","name":"w","slug":"w-1","workspace":"lab",
+                 "command":"bash","cwd":"/","tiled":true,"running":true,
+                 "title":null,"scratchpad":"/tmp/p"},
+                {"kind":"term","name":"r","slug":"r-1","workspace":"raid",
+                 "command":"bash","cwd":"/","tiled":true,"running":true,
+                 "title":null,"scratchpad":"/tmp/r"}],
+                "selected_workspace":"lab","focused_pane":"w-1",
+                "extra_workspaces":[],"workspace_order":["lab","raid"],
+                "asks":[],"statuses":[],"subscriptions":["lab"]}"#,
+        )
+        .unwrap()
+    }
+
+    /// Both circles active; `raid` holds the one pane.
+    fn two_circle_state_event() -> GuiEvent {
+        serde_json::from_str(
+            r#"{"event":"state","panes":[
+                {"kind":"term","name":"r","slug":"r-1","workspace":"raid",
+                 "command":"bash","cwd":"/","tiled":true,"running":true,
+                 "title":null,"scratchpad":"/tmp/r"}],
+                "selected_workspace":"raid","focused_pane":"r-1",
+                "extra_workspaces":["lab"],"workspace_order":["lab","raid"],
+                "asks":[],"statuses":[],"subscriptions":["lab","raid"],
+                "workspace_meta":[{"workspace":"raid","last_output_ms":0,
+                  "last_touch_ms":0}]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn displayed_active_ring_is_the_sidebar_order_live() {
+        let mut st = ClientState::default();
+        st.apply_event(two_circle_state_event(), 0.0);
+        st.touch_workspace("raid", 100.0);
+        assert_eq!(
+            st.displayed_active_ring(),
+            vec!["raid".to_string(), "lab".to_string()]
+        );
+        // A resort is reflected immediately — the ring IS the display.
+        st.touch_workspace("lab", 200.0);
+        assert_eq!(
+            st.displayed_active_ring(),
+            vec!["lab".to_string(), "raid".to_string()]
+        );
+    }
+
+    /// THE quicklaunch bug, web side: the launch button pins the circle the
+    /// instant you press it, and the `State` crossing that spawn on the wire
+    /// still knows nothing about it. Pruning straight against `known` pinned
+    /// it and then silently unpinned it, which is exactly how circles started
+    /// from the phone lost their pins.
+    #[test]
+    fn a_pin_placed_before_the_spawn_lands_survives_the_next_state() {
+        let mut st = ClientState::default();
+        st.apply_event(state_event(), 0.0);
+        // Launch: pin first, spawn is still in flight.
+        st.subs.pin("claude-24");
+        st.apply_event(state_event(), 10.0);
+        assert!(
+            st.subs.is_pinned("claude-24"),
+            "a pin for an unconfirmed circle must not be pruned"
+        );
+
+        // It arrives; the pin is now backed by a real circle.
+        st.apply_event(state_event_with_extra("claude-24"), 20.0);
+        assert!(st.subs.is_pinned("claude-24"));
+    }
+
+    /// The shield is a grace period, not an amnesty: a circle that never turns
+    /// up (or gets killed) still leaves the arrangement.
+    #[test]
+    fn a_pin_for_a_circle_that_never_arrives_is_eventually_pruned() {
+        let mut st = ClientState::default();
+        st.apply_event(state_event(), 0.0);
+        st.subs.pin("ghost");
+        st.apply_event(state_event(), 10.0);
+        assert!(st.subs.is_pinned("ghost"));
+        st.apply_event(
+            state_event(),
+            10.0 + seance_core::util::ABSENT_GRACE_MS as f64,
+        );
+        assert!(!st.subs.is_pinned("ghost"));
+    }
+
+    #[test]
+    fn pinned_section_floats_above_the_active_band_and_owns_the_ring() {
+        let mut st = ClientState::default();
+        st.apply_event(two_circle_state_event(), 0.0);
+        st.touch_workspace("raid", 100.0);
+        st.touch_workspace("lab", 200.0);
+        // Unpinned order: lab (fresher touch) then raid.
+        assert_eq!(st.unpinned_active_workspaces(), vec!["lab", "raid"]);
+        assert!(st.pinned_workspaces().is_empty());
+
+        // Pin the STALER circle: it jumps the whole band.
+        st.subs.pin("raid");
+        assert_eq!(st.pinned_workspaces(), vec!["raid".to_string()]);
+        assert_eq!(st.unpinned_active_workspaces(), vec!["lab".to_string()]);
+        // Spaces replaced the pinned band: a star never reorders the ring.
+        assert_eq!(
+            st.displayed_active_ring(),
+            vec!["lab".to_string(), "raid".to_string()]
+        );
+        // One space holds everything here, so the ring is the full list.
+        let mut ring = st.displayed_active_ring();
+        let mut active = st.active_workspaces();
+        ring.sort();
+        active.sort();
+        assert_eq!(ring, active);
+    }
+
+    #[test]
+    fn the_rail_lists_one_space_and_a_filter_spans_them_all() {
+        let mut st = ClientState::default();
+        st.apply_event(two_circle_state_event(), 0.0);
+        assert!(st.spaces_dirty, "first State migrates spaces");
+        assert_eq!(st.subs.spaces.space_of("lab"), "general");
+        let other = st.subs.spaces.create("other");
+        st.subs.spaces.move_circle("raid", &other);
+        st.selected_workspace = Some("lab".into());
+        assert_eq!(st.visible_workspaces(), vec!["lab".to_string()]);
+        st.rail_space = Some(other.clone());
+        assert_eq!(st.visible_workspaces(), vec!["raid".to_string()]);
+        st.subs.pin("lab");
+        st.subs.pin("raid");
+        st.rail_filter = RailFilter::Starred;
+        let mut both = st.visible_workspaces();
+        both.sort();
+        assert_eq!(both, vec!["lab".to_string(), "raid".to_string()]);
+    }
+
+    /// Touches minutes apart still order. Sub-second ones deliberately do not
+    /// — that jitter is what made repainting circles trade places.
+    #[test]
+    fn pinned_subset_keeps_the_working_idle_sort_internally() {
+        let mut st = ClientState::default();
+        st.apply_event(two_circle_state_event(), 0.0);
+        st.subs.pin("lab");
+        st.subs.pin("raid");
+        // Half an hour apart — inside ten minutes everything deliberately ties.
+        st.touch_workspace("lab", 600_000.0);
+        st.touch_workspace("raid", 2_400_000.0);
+        st.sync_working_touches(3_000_000.0);
+        assert_eq!(st.pinned_workspaces(), vec!["raid", "lab"]);
+        st.touch_workspace("lab", 3_000_000.0);
+        st.sync_working_touches(3_000_000.0);
+        assert_eq!(st.pinned_workspaces(), vec!["lab", "raid"]);
+    }
+
+    #[test]
+    fn global_state_is_kept_whole_not_filtered_to_subscriptions() {
+        let mut st = ClientState::default();
+        st.apply_event(global_state_event(), 0.0);
+        // Both circles and both panes survive ingest — the split is a render
+        // concern now, not an ingest filter.
+        assert_eq!(st.panes.len(), 2);
+        assert_eq!(st.workspaces(), vec!["lab".to_string(), "raid".to_string()]);
+    }
+
+    #[test]
+    fn first_state_marks_every_known_circle_seen() {
+        let mut st = ClientState::default();
+        st.apply_event(global_state_event(), 0.0);
+        assert!(st.subs_dirty, "seeding must be persisted");
+        assert_eq!(
+            st.active_workspaces(),
+            vec!["lab".to_string(), "raid".to_string()]
+        );
+        // Migration marks pre-existing circles seen: no retroactive `needs`.
+        assert_eq!(st.row_attention("raid"), None);
+    }
+
+    /// `lab` only, subscribed — the pre-existing world before a ctl spawn.
+    fn lab_only_event() -> GuiEvent {
+        serde_json::from_str(
+            r#"{"event":"state","panes":[
+                {"kind":"term","name":"w","slug":"w-1","workspace":"lab",
+                 "command":"bash","cwd":"/","tiled":true,"running":true,
+                 "title":null,"scratchpad":"/tmp/p"}],
+                "selected_workspace":"lab","focused_pane":"w-1",
+                "extra_workspaces":[],"workspace_order":["lab"],
+                "asks":[],"statuses":[],"subscriptions":["lab"]}"#,
+        )
+        .unwrap()
+    }
+
+    /// A circle ctl spawned with no GUI attribution used to badge `needs`;
+    /// the rail has no `needs` state now.
+    #[test]
+    fn a_ctl_spawned_circle_gets_no_badge() {
+        let mut st = ClientState::default();
+        st.apply_event(lab_only_event(), 0.0);
+        st.subs_dirty = false;
+        st.apply_event(global_state_event(), 0.0);
+        assert_eq!(st.row_attention("raid"), None);
+    }
+
+    #[test]
+    fn kill_prunes_everything() {
+        let mut st = ClientState::default();
+        st.apply_event(state_event(), 0.0);
+        st.grids.insert("w-1".into(), GridSnapshot::empty("w-1"));
+        st.apply_event(GuiEvent::PaneKilled { slug: "w-1".into() }, 0.0);
+        assert!(st.panes.is_empty() && st.grids.is_empty());
+    }
+
+    /// Panes across several circles, as a State push. `busy` marks the ones
+    /// the daemon says are spinning right now.
+    fn state_with(panes: &[(&str, &str, bool)]) -> GuiEvent {
+        let rows: Vec<String> = panes
+            .iter()
+            .enumerate()
+            .map(|(i, (ws, slug, busy))| {
+                format!(
+                    r#"{{"kind":"term","name":"p{i}","slug":"{slug}","workspace":"{ws}",
+                        "command":"bash","cwd":"/","tiled":true,"running":true,
+                        "title":null,"scratchpad":"/tmp/p","busy":{busy}}}"#
+                )
+            })
+            .collect();
+        let order: Vec<String> = panes.iter().map(|(ws, _, _)| format!("\"{ws}\"")).collect();
+        serde_json::from_str(&format!(
+            r#"{{"event":"state","panes":[{}],"selected_workspace":null,
+                "focused_pane":null,"extra_workspaces":[],
+                "workspace_order":[{}],"asks":[],"statuses":[]}}"#,
+            rows.join(","),
+            order.join(",")
+        ))
+        .unwrap()
+    }
+
+    /// The working band is alphabetical, so rows don't move while you read
+    /// them. Idle circles keep the recency sort below.
+    #[test]
+    fn working_band_sorts_alphabetically_above_the_idle_band() {
+        let mut st = ClientState::default();
+        st.apply_event(
+            state_with(&[
+                ("zulu", "z-1", true),
+                ("alpha", "a-1", true),
+                ("mike", "m-1", true),
+                ("idle-old", "o-1", false),
+                ("idle-new", "n-1", false),
+            ]),
+            0.0,
+        );
+        st.workspace_touch.insert("idle-old".into(), 10.0);
+        st.workspace_touch.insert("idle-new".into(), 900.0);
+
+        assert_eq!(
+            st.workspaces(),
+            vec!["alpha", "mike", "zulu", "idle-new", "idle-old"]
+        );
+    }
+
+    /// A circle is keyed by its slug and shown by its label. Renaming moves
+    /// only the label, so everything the client files under the slug — pins,
+    /// seen, activity clocks — is untouched by construction.
+    #[test]
+    fn a_label_changes_what_is_shown_and_nothing_else() {
+        let mut st = ClientState::default();
+        st.apply_event(state_with(&[("lab", "w-1", false)]), 0.0);
+        st.subs.seed(&["lab".to_string()]);
+        st.subs.pin("lab");
+        st.workspace_touch.insert("lab".into(), 123.0);
+
+        assert_eq!(
+            st.workspace_label("lab"),
+            "lab",
+            "unnamed reads as its slug"
+        );
+
+        // The daemon reports the new label against the same slug.
+        st.apply_event(state_labeled("lab", "w-1", Some("Growth Work")), 1.0);
+        assert_eq!(st.workspace_label("lab"), "Growth Work");
+        assert!(st.subs.is_pinned("lab"), "the pin is filed under the slug");
+        assert_eq!(st.workspace_touch.get("lab"), Some(&123.0));
+        assert_eq!(st.workspaces(), vec!["lab"]);
+
+        // Renamed back to its slug: the label entry disappears rather than
+        // lingering as a duplicate of the slug.
+        st.apply_event(state_labeled("lab", "w-1", None), 2.0);
+        assert!(st.workspace_names.is_empty());
+        assert_eq!(st.workspace_label("lab"), "lab");
+    }
+
+    /// One circle, with an optional label in its `workspace_meta` row.
+    fn state_labeled(ws: &str, slug: &str, label: Option<&str>) -> GuiEvent {
+        let name = match label {
+            Some(l) => format!(r#","name":"{l}""#),
+            None => String::new(),
+        };
+        serde_json::from_str(&format!(
+            r#"{{"event":"state","panes":[{{"kind":"term","name":"p","slug":"{slug}",
+                "workspace":"{ws}","command":"bash","cwd":"/","tiled":true,
+                "running":true,"title":null,"scratchpad":"/tmp/p"}}],
+                "selected_workspace":null,"focused_pane":null,"extra_workspaces":[],
+                "workspace_order":["{ws}"],"asks":[],"statuses":[],
+                "workspace_meta":[{{"workspace":"{ws}","last_output_ms":0,
+                                   "last_touch_ms":0{name}}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    /// Sleep verbs are gated on the daemon's restorability verdict, and a
+    /// circle reads asleep the moment any of its panes is.
+    #[test]
+    fn sleep_gating_follows_the_daemon_verdict() {
+        let mut st = ClientState::default();
+        st.apply_event(
+            state_with(&[("lab", "w-1", false), ("cadence", "c-1", false)]),
+            0.0,
+        );
+        // Nothing is restorable by default (shells) — no sleep verb offered.
+        assert!(!st.workspace_sleepable("lab"));
+        assert!(!st.workspace_asleep("lab"));
+
+        // Daemon says lab's only pane can be put back → offer it.
+        st.panes[0].restorable = true;
+        assert!(st.workspace_sleepable("lab"));
+
+        // One unrestorable pane in the circle vetoes the whole thing.
+        st.panes.push(st.panes[0].clone());
+        st.panes[2].slug = "w-2".into();
+        st.panes[2].restorable = false;
+        assert!(!st.workspace_sleepable("lab"));
+
+        // And asleep is per-circle, from any pane.
+        st.panes[2].asleep = true;
+        assert!(st.workspace_asleep("lab"));
+        assert!(!st.workspace_asleep("cadence"));
+    }
+
+    /// The whole point: a circle leaves the working band on the daemon's
+    /// broadcast, with nobody selecting or subscribing to it first.
+    #[test]
+    fn pane_busy_event_moves_a_circle_out_of_the_working_band() {
+        let mut st = ClientState::default();
+        st.apply_event(
+            state_with(&[("lab", "w-1", true), ("cadence", "c-1", false)]),
+            0.0,
+        );
+        st.sync_working_touches(0.0);
+        assert!(st.workspace_has_working_agent("lab"));
+        assert_eq!(st.workspaces(), vec!["lab", "cadence"]);
+
+        // No selection, no subscription, no grid frame — just the broadcast.
+        st.apply_event(
+            GuiEvent::PaneBusy {
+                pane: "w-1".into(),
+                busy: false,
+            },
+            1_000.0,
+        );
+        assert!(!st.workspace_has_working_agent("lab"));
+
+        // Freshly-finished work still lands at the top of the idle band, but
+        // on its OWN output clock — there is no finish-touch any more. A
+        // circle that just stopped working is by definition the one that
+        // produced output most recently.
+        st.workspace_activity.insert("lab".into(), 3_595_000.0);
+        st.workspace_activity.insert("cadence".into(), 100.0);
+        st.sync_working_touches(3_600_000.0);
+        assert_eq!(st.workspace_touch.get("lab"), None, "no finish-touch");
+        // lab 5s stale, cadence an hour — a real gap, so a real ordering.
+        // (Anything inside the same ten minutes ties; see recency_rank.)
+        assert_eq!(st.workspaces(), vec!["lab", "cadence"]);
+
+        // A repeat of the same verdict is not a structural change.
+        assert!(matches!(
+            st.apply_event(
+                GuiEvent::PaneBusy {
+                    pane: "w-1".into(),
+                    busy: false,
+                },
+                1_100.0,
+            ),
+            Applied::Nothing
+        ));
+    }
+}

@@ -1,0 +1,1650 @@
+//! Hermetic `handle_gui` tests for the SUBSCRIPTION model (0.12): Attach
+//! seeding, Subscribe, auto-subscribe on select/spawn/create,
+//! the grid-rate matrix, and the recorder invariant. Driven through a fake
+//! `GuiConn` (an in-memory `OutQueue` registered via `register_gui`). No real
+//! sockets, no PTYs (stub panes only), `SEANCE_STATE_DIR` guarded by
+//! `test_env_lock` via `with_test_state_dir`.
+
+use super::helpers::now_ms;
+use super::tests::with_test_state_dir;
+use super::*;
+use crate::control::ControlRequest;
+use crate::runtime::outqueue::OutQueue;
+use crate::runtime::protocol::{GuiEvent, GuiRequest};
+use crate::runtime::pty_session::SessionEvent;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+fn temp_scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "seance-gui-scratch-{}-{}-{}",
+        tag,
+        std::process::id(),
+        now_ms()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A fake GUI window: a registered `OutQueue` we can drain and inspect.
+/// Keeping it alive is what makes `prune_dead_guis` treat the window as live
+/// (it liveness-probes by pushing a `Pong`); dropping it closes the queue,
+/// which is this harness's way of saying "that window died".
+struct FakeGui {
+    id: String,
+    out: Arc<OutQueue>,
+}
+
+impl Drop for FakeGui {
+    fn drop(&mut self) {
+        self.out.close();
+    }
+}
+
+impl FakeGui {
+    fn attach_to(eng: &mut Engine) -> Self {
+        let out = Arc::new(OutQueue::new());
+        let id = eng.register_gui(Arc::clone(&out));
+        FakeGui { id, out }
+    }
+
+    /// Drain everything queued so far, dropping the `Pong` liveness probes that
+    /// `push_state_to_all` injects on every broadcast.
+    ///
+    /// Grid frames encode here, the same as the daemon's writer does — so a
+    /// test sees exactly the bytes a real client would.
+    fn drain(&self) -> Vec<GuiEvent> {
+        self.out
+            .drain_now()
+            .into_iter()
+            .map(|o| o.into_event())
+            .filter(|ev| !matches!(ev, GuiEvent::Pong))
+            .collect()
+    }
+
+    /// The most recent `State` event pushed to this window (after draining).
+    fn last_state(&self) -> Option<StateSnapshot> {
+        self.drain()
+            .into_iter()
+            .rev()
+            .find_map(StateSnapshot::from_event)
+    }
+}
+
+/// Flattened copy of a `GuiEvent::State` payload for ergonomic assertions.
+struct StateSnapshot {
+    selected_workspace: Option<String>,
+    focused_pane: Option<String>,
+    workspace_order: Vec<String>,
+    subscriptions: Vec<String>,
+    panes: Vec<String>,
+    window_id: Option<String>,
+    windows: Vec<(String, usize)>, // (window id, workspace_count)
+}
+
+impl StateSnapshot {
+    fn from_event(ev: GuiEvent) -> Option<Self> {
+        match ev {
+            GuiEvent::State {
+                selected_workspace,
+                focused_pane,
+                workspace_order,
+                subscriptions,
+                panes,
+                window_id,
+                windows,
+                ..
+            } => Some(StateSnapshot {
+                selected_workspace,
+                focused_pane,
+                workspace_order,
+                subscriptions,
+                panes: panes.into_iter().map(|p| p.slug).collect(),
+                window_id,
+                windows: windows
+                    .into_iter()
+                    .map(|w| (w.id, w.workspace_count))
+                    .collect(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn subscribes(&self, ws: &str) -> bool {
+        self.subscriptions.iter().any(|w| w == ws)
+    }
+
+    fn knows_ws(&self, ws: &str) -> bool {
+        self.workspace_order.iter().any(|w| w == ws)
+    }
+}
+
+/// Pull the `State` out of the `Some(GuiEvent)` returned by an Attach.
+fn state_of(ev: Option<GuiEvent>) -> StateSnapshot {
+    StateSnapshot::from_event(ev.expect("attach returns Some(State)"))
+        .expect("attach returns a State event")
+}
+
+/// Attach with the "seed me with everything" default (`subscriptions: None`).
+fn attach_all(eng: &mut Engine, id: &str) -> StateSnapshot {
+    state_of(eng.handle_gui(
+        GuiRequest::Attach {
+            selected_workspace: None,
+            focused_pane: None,
+            subscriptions: None,
+        },
+        id,
+    ))
+}
+
+/// Attach with an explicit subscription list.
+fn attach_with(eng: &mut Engine, id: &str, subs: &[&str]) -> StateSnapshot {
+    state_of(eng.handle_gui(
+        GuiRequest::Attach {
+            selected_workspace: None,
+            focused_pane: None,
+            subscriptions: Some(subs.iter().map(|s| s.to_string()).collect()),
+        },
+        id,
+    ))
+}
+
+#[test]
+fn attach_without_a_list_subscribes_to_every_workspace() {
+    with_test_state_dir("gui-attach", || {
+        let scratch = temp_scratch("gui-attach");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        eng.push_stub_pane("worker-a", "lab");
+        eng.push_stub_pane("worker-b", "cadence");
+
+        let g = FakeGui::attach_to(&mut eng);
+        let st = attach_all(&mut eng, &g.id);
+
+        assert_eq!(st.window_id.as_deref(), Some(g.id.as_str()));
+        assert!(st.subscribes("lab"), "subs={:?}", st.subscriptions);
+        assert!(st.subscribes("cadence"));
+        assert!(st.selected_workspace.is_some());
+        assert_eq!(st.panes.len(), 2);
+        assert_eq!(st.windows.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+#[test]
+fn attach_with_a_list_subscribes_to_the_known_intersection() {
+    with_test_state_dir("gui-attach-list", || {
+        let scratch = temp_scratch("gui-attach-list");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        eng.push_stub_pane("worker-a", "lab");
+        eng.push_stub_pane("worker-b", "cadence");
+
+        let g = FakeGui::attach_to(&mut eng);
+        let st = attach_with(&mut eng, &g.id, &["cadence", "ghost-circle"]);
+
+        assert_eq!(st.subscriptions, vec!["cadence".to_string()]);
+        assert_eq!(st.selected_workspace.as_deref(), Some("cadence"));
+        // State is GLOBAL now: lab is still described, just not subscribed.
+        assert!(st.knows_ws("lab"));
+        assert_eq!(st.panes.len(), 2, "panes are global: {:?}", st.panes);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+#[test]
+fn attach_with_empty_list_is_a_blank_window() {
+    with_test_state_dir("gui-attach-empty", || {
+        let scratch = temp_scratch("gui-attach-empty");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        eng.push_stub_pane("worker-a", "lab");
+        eng.push_stub_pane("worker-b", "cadence");
+
+        let g1 = FakeGui::attach_to(&mut eng);
+        let _ = attach_all(&mut eng, &g1.id);
+
+        let g2 = FakeGui::attach_to(&mut eng);
+        let st = attach_with(&mut eng, &g2.id, &[]);
+
+        assert_eq!(st.window_id.as_deref(), Some(g2.id.as_str()));
+        assert!(st.subscriptions.is_empty(), "{:?}", st.subscriptions);
+        assert!(st.selected_workspace.is_none());
+        // Blank means "subscribed to nothing", NOT "told nothing" — the census
+        // is what the rail renders from.
+        assert!(st.knows_ws("lab") && st.knows_ws("cadence"));
+        assert_eq!(st.windows.len(), 2);
+        // g1 keeps everything — a second window takes nothing away (no custody).
+        let s1 = g1.last_state().expect("g1 got a roster refresh");
+        assert!(s1.subscribes("lab") && s1.subscribes("cadence"));
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+#[test]
+fn two_windows_can_subscribe_to_the_same_workspace() {
+    with_test_state_dir("gui-shared-sub", || {
+        let scratch = temp_scratch("gui-shared-sub");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        eng.push_stub_pane("worker-a", "lab");
+
+        let g1 = FakeGui::attach_to(&mut eng);
+        let _ = attach_all(&mut eng, &g1.id);
+        let g2 = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &g2.id, &[]);
+
+        let _ = eng.handle_gui(
+            GuiRequest::Subscribe {
+                workspace: "lab".into(),
+            },
+            &g2.id,
+        );
+
+        assert!(eng.subscriptions_of(&g1.id).contains(&"lab".to_string()));
+        assert!(eng.subscriptions_of(&g2.id).contains(&"lab".to_string()));
+        let s2 = g2.last_state().expect("subscribe pushes State");
+        assert!(s2.subscribes("lab"));
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+#[test]
+fn selecting_an_unsubscribed_workspace_auto_subscribes() {
+    with_test_state_dir("gui-focus-sub", || {
+        let scratch = temp_scratch("gui-focus-sub");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        eng.push_stub_pane("worker-a", "lab");
+        eng.push_stub_pane("worker-b", "cadence");
+
+        let g = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &g.id, &["lab"]);
+        assert!(!eng.subscriptions_of(&g.id).contains(&"cadence".to_string()));
+
+        let _ = eng.handle_gui(
+            GuiRequest::SetFocus {
+                pane: None,
+                workspace: Some("cadence".into()),
+            },
+            &g.id,
+        );
+        assert!(eng.subscriptions_of(&g.id).contains(&"cadence".to_string()));
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+#[test]
+fn gui_spawn_and_create_auto_subscribe_the_requester() {
+    with_test_state_dir("gui-spawn-sub", || {
+        let scratch = temp_scratch("gui-spawn-sub");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        eng.push_stub_pane("worker-a", "lab");
+
+        let g = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &g.id, &["lab"]);
+
+        let _ = eng.handle_gui(
+            GuiRequest::CreateWorkspace {
+                name: "notes".into(),
+            },
+            &g.id,
+        );
+        assert!(eng.subscriptions_of(&g.id).contains(&"notes".to_string()));
+
+        // A ctl-side spawn subscribes NOBODY — GUIs badge it `needs`.
+        let _ = eng.spawn(SpawnSpec {
+            name: "ctl-worker".into(),
+            cwd: None,
+            command: None,
+            workspace: Some("offstage".into()),
+            tiled: true,
+            resume: false,
+            file: None,
+        });
+        assert!(!eng
+            .subscriptions_of(&g.id)
+            .contains(&"offstage".to_string()));
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+#[test]
+fn set_overview_flips_flag_without_error() {
+    with_test_state_dir("gui-overview", || {
+        let scratch = temp_scratch("gui-overview");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        eng.push_stub_pane("worker-a", "lab");
+        let g1 = FakeGui::attach_to(&mut eng);
+        let _ = attach_all(&mut eng, &g1.id);
+
+        // Enabling overview returns no event (fire-and-forget) and doesn't panic
+        // even with a session-less stub pane (the FULL-flush loop skips it).
+        let r = eng.handle_gui(GuiRequest::SetOverview { enabled: true }, &g1.id);
+        assert!(r.is_none());
+        let r = eng.handle_gui(GuiRequest::SetOverview { enabled: false }, &g1.id);
+        assert!(r.is_none());
+
+        // Overview against an unknown window id must not panic.
+        let r = eng.handle_gui(GuiRequest::SetOverview { enabled: true }, "w-nope");
+        assert!(r.is_none());
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+#[test]
+fn bye_drops_the_window_without_reassigning_anything() {
+    with_test_state_dir("gui-bye", || {
+        let scratch = temp_scratch("gui-bye");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        eng.push_stub_pane("worker-a", "lab");
+        eng.push_stub_pane("worker-b", "cadence");
+
+        let g1 = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &g1.id, &["lab"]);
+        let g2 = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &g2.id, &["cadence"]);
+
+        let r = eng.handle_gui(GuiRequest::Bye, &g2.id);
+        assert!(r.is_none());
+        assert!(!eng.has_gui_window(&g2.id));
+        // The survivor's subscription set is untouched — no "dump into the
+        // fullest window" inheritance any more.
+        assert_eq!(eng.subscriptions_of(&g1.id), vec!["lab".to_string()]);
+        let s1 = g1.last_state().expect("g1 State after Bye");
+        assert_eq!(s1.subscriptions, vec!["lab".to_string()]);
+        // cadence still exists globally, just unsubscribed everywhere.
+        assert!(s1.knows_ws("cadence"));
+        assert_eq!(s1.windows.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+#[test]
+fn reattach_restores_last_selected_workspace() {
+    with_test_state_dir("gui-restore-sel", || {
+        let scratch = temp_scratch("gui-restore-sel");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        eng.push_stub_pane("worker-a", "lab");
+        eng.push_stub_pane("worker-b", "cadence");
+        eng.push_stub_pane("worker-c", "notes");
+
+        let g1 = FakeGui::attach_to(&mut eng);
+        let _ = attach_all(&mut eng, &g1.id);
+        let _ = eng.handle_gui(
+            GuiRequest::SetFocus {
+                pane: Some("worker-b".into()),
+                workspace: Some("cadence".into()),
+            },
+            &g1.id,
+        );
+        assert_eq!(eng.selected_workspace.as_deref(), Some("cadence"));
+        assert_eq!(eng.focused_pane.as_deref(), Some("worker-b"));
+
+        let _ = eng.handle_gui(GuiRequest::Bye, &g1.id);
+        assert!(eng.gui_conns.is_empty());
+        assert_eq!(
+            eng.selected_workspace.as_deref(),
+            Some("cadence"),
+            "Bye must not forget the last selection"
+        );
+
+        let g2 = FakeGui::attach_to(&mut eng);
+        let st = attach_all(&mut eng, &g2.id);
+        assert_eq!(
+            st.selected_workspace.as_deref(),
+            Some("cadence"),
+            "reattach should restore prior workspace, not jump to first"
+        );
+        assert_eq!(
+            st.focused_pane.as_deref(),
+            Some("worker-b"),
+            "reattach should restore prior focused pane"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+#[test]
+fn grid_interval_is_the_fastest_rate_any_subscriber_wants() {
+    with_test_state_dir("gui-interval", || {
+        let scratch = temp_scratch("gui-interval");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let sel = eng.push_stub_pane("worker-a", "lab");
+        let other = eng.push_stub_pane("worker-b", "cadence");
+        let parked = eng.push_stub_pane("worker-c", "notes");
+
+        let g1 = FakeGui::attach_to(&mut eng);
+        let _ = state_of(eng.handle_gui(
+            GuiRequest::Attach {
+                selected_workspace: Some("lab".into()),
+                focused_pane: None,
+                subscriptions: Some(vec!["lab".into(), "cadence".into()]),
+            },
+            &g1.id,
+        ));
+
+        // Selected workspace → ~60fps (16ms).
+        assert_eq!(eng.grid_interval_ms_for(&sel), Some(16));
+        // Subscribed, non-selected, overview off → not streamed.
+        assert_eq!(eng.grid_interval_ms_for(&other), None);
+        // Unsubscribed → never streamed, overview or not.
+        assert_eq!(eng.grid_interval_ms_for(&parked), None);
+
+        // Overview → subscribed-but-not-selected circles push at the thumb rate.
+        let _ = eng.handle_gui(GuiRequest::SetOverview { enabled: true }, &g1.id);
+        assert_eq!(eng.grid_interval_ms_for(&sel), Some(16));
+        assert_eq!(eng.grid_interval_ms_for(&other), Some(66));
+        assert_eq!(
+            eng.grid_interval_ms_for(&parked),
+            None,
+            "overview must not resurrect an unsubscribed circle"
+        );
+
+        // A second window selecting "cadence" makes it the fast one: the pane's
+        // rate is the MIN across interested connections.
+        let g2 = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &g2.id, &["cadence"]);
+        let _ = eng.handle_gui(
+            GuiRequest::SetFocus {
+                pane: None,
+                workspace: Some("cadence".into()),
+            },
+            &g2.id,
+        );
+        assert_eq!(eng.grid_interval_ms_for(&other), Some(16));
+
+        // g1 leaving drops it back to its own overview thumb rate.
+        let _ = eng.handle_gui(GuiRequest::SetOverview { enabled: false }, &g1.id);
+        assert_eq!(eng.grid_interval_ms_for(&other), Some(16));
+        let _ = eng.handle_gui(GuiRequest::Bye, &g2.id);
+        assert_eq!(eng.grid_interval_ms_for(&other), None);
+
+        // Unknown pane slug → None (no panic).
+        assert_eq!(eng.grid_interval_ms_for("ghost-slug"), None);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// The DVR is not a function of who's watching: `record_grid_tap` must run for
+/// a pane in a workspace with ZERO subscribers (no grid rate, no fan-out), and
+/// the workspace output clock must still advance.
+#[test]
+fn recorder_tap_and_activity_clock_fire_with_zero_subscribers() {
+    with_test_state_dir("gui-tap-parked", || {
+        let scratch = temp_scratch("gui-tap-parked");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let parked = eng.push_stub_pane("worker-a", "offstage");
+
+        let g = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &g.id, &[]);
+        assert!(eng.subscriptions_of(&g.id).is_empty());
+        assert_eq!(
+            eng.grid_interval_ms_for(&parked),
+            None,
+            "nobody is streaming this pane"
+        );
+
+        eng.handle_session_event(SessionEvent::Wakeup {
+            slug: parked.clone(),
+        });
+        assert!(
+            eng.record_tap_log.contains(&parked),
+            "PTY wakeup must reach the recorder tap even with no subscribers"
+        );
+
+        eng.record_tap_log.clear();
+        eng.handle_session_event(SessionEvent::FlushGrid {
+            slug: parked.clone(),
+        });
+        assert!(eng.record_tap_log.contains(&parked));
+
+        // …and the daemon-owned activity clock still advances + broadcasts.
+        eng.handle_session_event(SessionEvent::ActivityNote {
+            slug: parked.clone(),
+            t_ms: 1_700_000_000_000,
+        });
+        assert_eq!(
+            eng.workspace_output.get("offstage"),
+            Some(&1_700_000_000_000)
+        );
+        assert!(g.drain().iter().any(|ev| matches!(
+            ev,
+            GuiEvent::Activity { workspace, .. } if workspace == "offstage"
+        )));
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// A rename no longer disturbs a subscription set — there is nothing to
+/// migrate, because the slug every set holds does not move. Killing by the
+/// new LABEL still resolves to that slug and clears every set.
+#[test]
+fn rename_leaves_subscriptions_alone_and_kill_by_label_clears_them() {
+    with_test_state_dir("gui-rename-kill", || {
+        let scratch = temp_scratch("gui-rename-kill");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        eng.push_stub_pane("worker-a", "lab");
+        eng.push_stub_pane("worker-b", "cadence");
+
+        let g1 = FakeGui::attach_to(&mut eng);
+        let _ = attach_all(&mut eng, &g1.id);
+        let g2 = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &g2.id, &["lab"]);
+
+        let _ = eng.handle_gui(
+            GuiRequest::RenameWorkspace {
+                old: "lab".into(),
+                new: "workshop".into(),
+            },
+            &g1.id,
+        );
+        for id in [&g1.id, &g2.id] {
+            let subs = eng.subscriptions_of(id);
+            assert!(
+                subs.contains(&"lab".to_string()),
+                "the slug is the subscription and it does not move ({id}): {subs:?}"
+            );
+        }
+        assert_eq!(eng.workspace_label("lab"), "workshop");
+
+        // Addressed by the label a human now sees — resolved at the door.
+        let _ = eng.handle_gui(
+            GuiRequest::KillWorkspace {
+                workspace: "workshop".into(),
+            },
+            &g1.id,
+        );
+        for id in [&g1.id, &g2.id] {
+            assert!(
+                !eng.subscriptions_of(id).contains(&"lab".to_string()),
+                "a killed circle must leave every subscription set ({id})"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+#[test]
+fn prune_dead_guis_drops_the_window_and_leaves_peers_alone() {
+    with_test_state_dir("gui-prune", || {
+        let scratch = temp_scratch("gui-prune");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        eng.push_stub_pane("worker-a", "lab");
+        eng.push_stub_pane("worker-b", "cadence");
+
+        let g1 = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &g1.id, &["lab"]);
+        let g2 = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &g2.id, &["cadence"]);
+        let g2_id = g2.id.clone();
+
+        // Kill g2's receiver — its send channel is now dead.
+        drop(g2);
+        eng.prune_dead_guis();
+
+        assert!(!eng.has_gui_window(&g2_id));
+        assert!(eng.has_gui_window(&g1.id));
+        assert_eq!(eng.subscriptions_of(&g1.id), vec!["lab".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// The activity clocks are daemon state: an ActivityNote stamps the pane's
+/// workspace and pushes an incremental `Activity`, human input stamps touch,
+/// and both ride every `State` push so a relaunched window can seed itself
+/// instead of starting blank.
+#[test]
+fn activity_and_touch_clocks_are_daemon_owned() {
+    with_test_state_dir("gui-clocks", || {
+        let scratch = temp_scratch("gui-clocks");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let slug = eng.push_stub_pane("worker-a", "lab");
+
+        let g = FakeGui::attach_to(&mut eng);
+        let _ = attach_all(&mut eng, &g.id);
+        g.drain();
+
+        // Recorder note → workspace clock + incremental broadcast.
+        eng.handle_session_event(SessionEvent::ActivityNote {
+            slug: slug.clone(),
+            t_ms: 1_700_000_000_000,
+        });
+        assert_eq!(eng.workspace_output.get("lab"), Some(&1_700_000_000_000));
+        let acts: Vec<(String, u64)> = g
+            .drain()
+            .into_iter()
+            .filter_map(|ev| match ev {
+                GuiEvent::Activity {
+                    workspace,
+                    last_output_ms,
+                } => Some((workspace, last_output_ms)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(acts, vec![("lab".to_string(), 1_700_000_000_000)]);
+
+        // Older note never walks the clock back, and emits nothing.
+        eng.handle_session_event(SessionEvent::ActivityNote {
+            slug: slug.clone(),
+            t_ms: 1_600_000_000_000,
+        });
+        assert_eq!(eng.workspace_output.get("lab"), Some(&1_700_000_000_000));
+        assert!(g.drain().is_empty());
+
+        // Human input stamps touch (ctl/agent sends deliberately do not).
+        assert!(eng.workspace_touch_ms.get("lab").is_none());
+        let _ = eng.handle_gui(
+            GuiRequest::Input {
+                pane: slug.clone(),
+                bytes_b64: "aGk=".into(),
+            },
+            &g.id,
+        );
+        assert!(eng.workspace_touch_ms.get("lab").copied().unwrap_or(0) > 0);
+
+        // GUI relaunch: the window dies, a fresh one attaches and must get
+        // both clocks in its State push (the whole point of daemon ownership).
+        drop(g);
+        eng.prune_dead_guis();
+        let g2 = FakeGui::attach_to(&mut eng);
+        let st = eng.handle_gui(
+            GuiRequest::Attach {
+                selected_workspace: None,
+                focused_pane: None,
+                subscriptions: None,
+            },
+            &g2.id,
+        );
+        let meta = match st {
+            Some(GuiEvent::State { workspace_meta, .. }) => workspace_meta,
+            _ => panic!("attach returns State"),
+        };
+        let lab = meta
+            .iter()
+            .find(|m| m.workspace == "lab")
+            .expect("lab meta present");
+        assert_eq!(lab.last_output_ms, 1_700_000_000_000);
+        assert!(lab.last_touch_ms > 0);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// An unsubscribed circle still reports its real clocks — the census a rail
+/// list will render from must not be blank.
+#[test]
+fn workspace_meta_covers_unsubscribed_workspaces() {
+    with_test_state_dir("gui-meta-parked", || {
+        let scratch = temp_scratch("gui-meta-parked");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let slug = eng.push_stub_pane("worker-a", "offstage");
+        eng.handle_session_event(SessionEvent::ActivityNote {
+            slug,
+            t_ms: 1_700_000_000_000,
+        });
+
+        let g = FakeGui::attach_to(&mut eng);
+        let st = eng.handle_gui(
+            GuiRequest::Attach {
+                selected_workspace: None,
+                focused_pane: None,
+                subscriptions: Some(vec![]),
+            },
+            &g.id,
+        );
+        let meta = match st {
+            Some(GuiEvent::State { workspace_meta, .. }) => workspace_meta,
+            _ => panic!("attach returns State"),
+        };
+        let m = meta
+            .iter()
+            .find(|m| m.workspace == "offstage")
+            .expect("unsubscribed circle still has meta");
+        assert_eq!(m.last_output_ms, 1_700_000_000_000);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// Nit #2, client-visible half: killing the last pane of an implicitly-created
+/// workspace drops the row from the State push (and from subscriptions).
+#[test]
+fn empty_workspace_row_disappears_after_last_pane_dies() {
+    with_test_state_dir("gui-prune", || {
+        let scratch = temp_scratch("gui-prune");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let slug = eng.push_stub_pane("worker", "lab");
+        eng.workspace_order.push("lab".into());
+        let gui = FakeGui::attach_to(&mut eng);
+        let st = attach_all(&mut eng, &gui.id);
+        assert!(st.knows_ws("lab") && st.subscribes("lab"));
+        gui.drain();
+
+        eng.kill_pane(&slug);
+        eng.push_state_to_all();
+
+        let st = gui.last_state().expect("state after kill");
+        assert!(!st.knows_ws("lab"));
+        assert!(!st.subscribes("lab"));
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// The bug this fixes: a circle that stopped working kept its spinner until
+/// you clicked it. Grid frames (which carry the OSC title) are sent only to
+/// windows streaming that pane, so a window looking at another circle never
+/// learned the title had gone idle. Busy flips are broadcast instead —
+/// including to a window that subscribes to neither the pane nor its circle.
+#[test]
+fn busy_flips_reach_a_window_that_does_not_subscribe_to_the_circle() {
+    with_test_state_dir("gui-busy", || {
+        let scratch = temp_scratch("gui-busy");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let worker = eng.push_stub_pane("worker", "lab");
+        eng.push_stub_pane("other", "cadence");
+
+        // This window watches `cadence` only — it never subscribed to `lab`.
+        let gui = FakeGui::attach_to(&mut eng);
+        let st = attach_with(&mut eng, &gui.id, &["cadence"]);
+        assert!(!st.subscribes("lab"), "subs={:?}", st.subscriptions);
+        gui.drain();
+
+        eng.handle_session_event(SessionEvent::Title {
+            slug: worker.clone(),
+            title: Some("\u{2809} building".into()),
+        });
+        assert_eq!(
+            busy_events(&gui.drain()),
+            vec![(worker.clone(), true)],
+            "spinner in an unsubscribed circle must still be announced"
+        );
+
+        // Same busy title again: edge-triggered, so nothing new on the wire.
+        eng.handle_session_event(SessionEvent::Title {
+            slug: worker.clone(),
+            title: Some("\u{280B} building".into()),
+        });
+        assert!(busy_events(&gui.drain()).is_empty(), "no flip, no event");
+
+        // Work finished. THIS is the event the sidebar was never getting.
+        eng.handle_session_event(SessionEvent::Title {
+            slug: worker.clone(),
+            title: Some("\u{2733} idle".into()),
+        });
+        assert_eq!(busy_events(&gui.drain()), vec![(worker.clone(), false)]);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// A fresh window's State push carries the daemon's busy verdict, so a GUI
+/// that attaches mid-spinner starts in the working band without waiting for
+/// the next flip.
+#[test]
+fn state_push_seeds_busy_from_the_daemon() {
+    with_test_state_dir("gui-busy-seed", || {
+        let scratch = temp_scratch("gui-busy-seed");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let worker = eng.push_stub_pane("worker", "lab");
+        eng.push_stub_pane("idle-one", "lab");
+        eng.handle_session_event(SessionEvent::Title {
+            slug: worker.clone(),
+            title: Some("\u{2809} building".into()),
+        });
+
+        let gui = FakeGui::attach_to(&mut eng);
+        let _ = attach_all(&mut eng, &gui.id);
+        let busy = eng
+            .pane_infos()
+            .into_iter()
+            .filter(|p| p.busy)
+            .map(|p| p.slug)
+            .collect::<Vec<_>>();
+        assert_eq!(busy, vec![worker.clone()]);
+
+        // A killed pane doesn't linger in the busy set.
+        eng.kill_pane(&worker);
+        assert!(eng.pane_infos().iter().all(|p| !p.busy));
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// `(pane, busy)` pairs in wire order.
+fn busy_events(evs: &[GuiEvent]) -> Vec<(String, bool)> {
+    evs.iter()
+        .filter_map(|ev| match ev {
+            GuiEvent::PaneBusy { pane, busy } => Some((pane.clone(), *busy)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Restorability is the whole gate on sleep. A stub pane runs `bash -l`, which
+/// is exactly the case that must be refused: a shell's cwd drift, history and
+/// children can't be rebuilt, so it vetoes its circle.
+#[test]
+fn a_shell_pane_is_not_restorable_and_vetoes_its_circle() {
+    with_test_state_dir("sleep-gate", || {
+        let scratch = temp_scratch("sleep-gate");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let shell = eng.push_stub_pane("worker", "lab");
+
+        assert!(!eng.pane_restorable(&shell));
+        assert!(!eng.workspace_restorable("lab"));
+        assert_eq!(eng.workspace_sleep_blockers("lab"), vec![shell.clone()]);
+
+        let e = eng.sleep_workspace("lab").unwrap_err().to_string();
+        assert!(e.contains("not restorable"), "{e}");
+        assert!(e.contains(&shell), "{e}");
+        // Refused means untouched: the pane is still there, still awake.
+        assert!(eng.panes.iter().any(|p| p.slug == shell && !p.asleep));
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// A claude pane with a live conversation id sleeps, keeps its identity, and
+/// its `Exited` (which sleeping causes) must not auto-close it.
+#[test]
+fn sleeping_keeps_the_pane_and_survives_its_own_exit_event() {
+    with_test_state_dir("sleep-keep", || {
+        let scratch = temp_scratch("sleep-keep");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let slug = eng.push_stub_pane("agent", "lab");
+        fake_claude_pane(&mut eng, &slug, "sleep-keep");
+
+        assert!(eng.pane_restorable(&slug));
+        assert_eq!(eng.sleep_workspace("lab").unwrap(), 1);
+        assert!(eng.workspace_asleep("lab"));
+        let p = eng.panes.iter().find(|p| p.slug == slug).unwrap();
+        assert!(p.asleep && p.session.is_none());
+        assert!(p.agent_session.is_some(), "conversation id is kept");
+
+        // The PTY death that sleeping caused arrives late. It must be ignored:
+        // the auto-close path would delete the pane we just slept.
+        eng.handle_session_event(SessionEvent::Exited {
+            slug: slug.clone(),
+            generation: 0,
+            code: Some(0),
+        });
+        assert!(eng.panes.iter().any(|p| p.slug == slug && p.asleep));
+
+        // Sleeping twice is a no-op, not an error (sweep vs right-click race).
+        assert!(!eng.sleep_pane(&slug).unwrap());
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// A `claude-mac` pane with its conversation id pinned in the command can be
+/// slept by hand (the transcript is on the Mac, so nothing here could vouch for
+/// it), but never by the sweep (nothing here sees what runs over there); its
+/// exit event is ignored; and waking runs the very same command again, whatever
+/// a hosted record or a saved session id says. A plain shell beside it still
+/// vetoes its own circle.
+#[test]
+fn a_pinned_claude_mac_pane_sleeps_by_hand_and_wakes_on_its_own_command() {
+    use std::os::unix::fs::PermissionsExt as _;
+    with_test_state_dir("sleep-claude-mac", || {
+        let scratch = temp_scratch("sleep-claude-mac");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let slug = eng.push_stub_pane("lead", "lab");
+        let shell = eng.push_stub_pane("worker", "other");
+        let control = eng.push_stub_pane("agent", "plain");
+        fake_claude_pane(&mut eng, &control, "mac-control");
+
+        // A stand-in `claude-mac` that records what it was run with.
+        let bin = scratch.join("claude-mac");
+        let ran = scratch.join("ran.txt");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$CLAUDE_MAC_ARGS\" \"$*\" > '{}'\nsleep 30\n",
+                ran.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pinned = "441ac7a9-2dd2-4942-a3fa-b77d17b64255";
+        let command = format!(
+            "env LEAD_UNATTENDED=1 CLAUDE_MAC_ARGS='--resume {pinned}' {}",
+            bin.display()
+        );
+        let cwd = std::env::temp_dir().to_string_lossy().to_string();
+        let pane_id = {
+            let p = eng.panes.iter_mut().find(|p| p.slug == slug).unwrap();
+            p.command = command.clone();
+            p.cwd = cwd.clone();
+            // Bait for the other restore paths: a saved session id, and a hosted
+            // record whose conversation is on disk. Neither may rewrite the command.
+            p.agent_session = Some("11111111-2222-4333-a444-555555555555".into());
+            p.pane_id.clone()
+        };
+        let other = "99999999-8888-4777-a666-555555555555";
+        let transcript = super::agent_session::claude_transcript(&cwd, other);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, b"{}\n").unwrap();
+        let record = super::sleep::hosted_path(&pane_id).unwrap();
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(&record, format!(r#"{{"session":"{other}","cwd":"{cwd}"}}"#)).unwrap();
+
+        assert!(eng.pane_restorable(&slug));
+        assert!(!eng.pane_restorable(&shell), "a bare shell still vetoes");
+        assert!(eng.sleep_workspace("other").is_err());
+
+        // The sweep leaves it alone however idle it is; a plain claude pane in
+        // another circle, as idle, is taken.
+        let now = now_ms();
+        let day = 24 * 60 * 60 * 1000;
+        eng.started_ms = now - 2 * day;
+        assert_eq!(
+            eng.auto_sleep_candidates(6 * 60 * 60 * 1000, now, &[]),
+            vec![control]
+        );
+
+        // By hand it sleeps.
+        assert_eq!(eng.sleep_workspace("lab").unwrap(), 1);
+        assert!(eng.panes.iter().any(|p| p.slug == slug && p.asleep));
+
+        // The exit that sleeping caused must not close the pane.
+        eng.handle_session_event(SessionEvent::Exited {
+            slug: slug.clone(),
+            generation: 0,
+            code: Some(130),
+        });
+        assert!(eng.panes.iter().any(|p| p.slug == slug && p.asleep));
+        assert!(eng.pane_restorable(&slug), "still restorable asleep");
+
+        // Waking runs the pane's own command: the stand-in sees the pinned
+        // arguments and nothing appended. A hosted launch would never run it,
+        // and a resume appended to the command would show in its arguments.
+        assert!(eng.wake_pane(&slug).unwrap());
+        let mut seen = String::new();
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(&ran) {
+                seen = text;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(seen, format!("--resume {pinned}|\n"));
+        let p = eng.panes.iter_mut().find(|p| p.slug == slug).unwrap();
+        assert!(!p.asleep && p.session.is_some());
+        assert_eq!(p.command, command);
+        if let Some(s) = p.session.take() {
+            s.shutdown();
+        }
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// A status-set that repeats the pane's last (state, note) changes nothing a
+/// window shows, so it isn't broadcast; a new note is.
+#[test]
+fn repeated_status_set_is_not_broadcast() {
+    with_test_state_dir("status-repeat", || {
+        let scratch = temp_scratch("status-repeat");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let slug = eng.push_stub_pane("worker", "lab");
+        let gui = FakeGui::attach_to(&mut eng);
+        let set = |eng: &mut Engine, note: &str| {
+            let r = eng.handle_control(ControlRequest::StatusSet {
+                state: "working".into(),
+                note: Some(note.into()),
+                pane: Some(slug.clone()),
+                scope: None,
+                from: None,
+            });
+            assert!(r.ok, "{:?}", r.error);
+        };
+        let statuses = |gui: &FakeGui| {
+            gui.drain()
+                .into_iter()
+                .filter(|ev| matches!(ev, GuiEvent::Status { .. }))
+                .count()
+        };
+        gui.drain();
+
+        set(&mut eng, "reading");
+        assert_eq!(statuses(&gui), 1);
+        set(&mut eng, "reading");
+        assert_eq!(statuses(&gui), 0, "a repeat is skipped");
+        set(&mut eng, "writing");
+        assert_eq!(statuses(&gui), 1);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// A pane that woke on a new session must not die of the old session's exit.
+/// Shutdown is async, so the slept PTY's `Exited` can land after the wake;
+/// only an exit from the session the pane holds now closes it.
+#[test]
+fn a_late_exit_from_the_replaced_session_leaves_the_woken_pane() {
+    with_test_state_dir("sleep-race", || {
+        let scratch = temp_scratch("sleep-race");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let slug = eng.push_stub_pane("agent", "lab");
+        let (workspace, pane_id) = {
+            let p = eng.panes.iter().find(|p| p.slug == slug).unwrap();
+            (p.workspace.clone(), p.pane_id.clone())
+        };
+        let cwd = std::env::temp_dir().to_string_lossy().to_string();
+        let spawn = |eng: &Engine| {
+            eng.spawn_terminal_session(&slug, "sleep 30", &cwd, &workspace, &pane_id)
+                .unwrap()
+        };
+        let old = spawn(&eng);
+        let old_gen = old.generation;
+        old.shutdown();
+        let new = spawn(&eng);
+        let new_gen = new.generation;
+        assert_ne!(old_gen, new_gen);
+        let idx = eng.panes.iter().position(|p| p.slug == slug).unwrap();
+        eng.panes[idx].session = Some(new);
+
+        eng.handle_session_event(SessionEvent::Exited {
+            slug: slug.clone(),
+            generation: old_gen,
+            code: None,
+        });
+        assert!(eng.panes.iter().any(|p| p.slug == slug), "woken pane kept");
+
+        eng.handle_session_event(SessionEvent::Exited {
+            slug: slug.clone(),
+            generation: new_gen,
+            code: Some(0),
+        });
+        assert!(
+            !eng.panes.iter().any(|p| p.slug == slug),
+            "its own exit closes it"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// The sweep takes idle restorable panes one by one: a shell beside them
+/// doesn't block, and busy, waiting, focused, skipped or recently touched
+/// panes stay awake. Screen output never counts as activity.
+#[test]
+fn auto_sleep_takes_idle_restorable_panes() {
+    with_test_state_dir("sleep-sweep", || {
+        let scratch = temp_scratch("sleep-sweep");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let idle = eng.push_stub_pane("agent", "quiet");
+        let shell = eng.push_stub_pane("worker", "quiet");
+        let busy = eng.push_stub_pane("agent", "busy-circle");
+        let asking = eng.push_stub_pane("agent", "asking-circle");
+        let skipped = eng.push_stub_pane("agent", "alpha-circle");
+        fake_claude_pane(&mut eng, &idle, "sweep-1");
+        fake_claude_pane(&mut eng, &busy, "sweep-2");
+        fake_claude_pane(&mut eng, &asking, "sweep-3");
+        fake_claude_pane(&mut eng, &skipped, "sweep-4");
+
+        let now = now_ms();
+        let day = 24 * 60 * 60 * 1000;
+        eng.started_ms = now - day;
+        // Output a second ago is a status line redrawing, not activity.
+        eng.workspace_output.insert("quiet".into(), now - 1000);
+        eng.pane_busy.insert(busy.clone());
+        eng.statuses
+            .insert(asking.clone(), ("needs-human".into(), None));
+        let skip = vec!["alpha-circle".to_string()];
+
+        let idle_ms = 6 * 60 * 60 * 1000;
+        // An open task or a waiting send doesn't keep an idle pane awake.
+        eng.begin_task(&idle, "never finished");
+        eng.queue_task(&idle, "next", "cli");
+        assert_eq!(
+            eng.auto_sleep_candidates(idle_ms, now, &skip),
+            vec![idle.clone()]
+        );
+
+        // A recent busy change, human input, or focus keeps it awake.
+        eng.pane_busy_at.insert(idle.clone(), now - 60_000);
+        assert!(eng.auto_sleep_candidates(idle_ms, now, &skip).is_empty());
+        eng.pane_busy_at.insert(idle.clone(), now - day);
+        eng.workspace_touch_ms.insert("quiet".into(), now - 60_000);
+        assert!(eng.auto_sleep_candidates(idle_ms, now, &skip).is_empty());
+        eng.workspace_touch_ms.insert("quiet".into(), now - day);
+        eng.focused_pane = Some(idle.clone());
+        assert!(eng.auto_sleep_candidates(idle_ms, now, &skip).is_empty());
+        eng.focused_pane = None;
+
+        // The shell sharing its circle stays up; the Claude pane sleeps.
+        assert_eq!(eng.auto_sleep_sweep(idle_ms, &skip), vec![idle.clone()]);
+        assert!(!eng.panes.iter().find(|p| p.slug == shell).unwrap().asleep);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+#[test]
+fn hosted_claude_records_titles_and_launch() {
+    use super::sleep::{hosted_launch, parse_hosted, title_is_claude};
+    assert_eq!(
+        parse_hosted(r#"{"session":"abc","cwd":"/home/you/x y"}"#),
+        Some(("abc".into(), "/home/you/x y".into()))
+    );
+    assert_eq!(parse_hosted(r#"{"session":"","cwd":"/x"}"#), None);
+    assert_eq!(parse_hosted("not json"), None);
+    assert!(title_is_claude(Some("\u{2733} Q4 roadmap review")));
+    assert!(title_is_claude(Some("\u{25D0} working")));
+    assert!(!title_is_claude(Some("demo@devbox:~")));
+    assert!(!title_is_claude(None));
+    assert_eq!(
+        hosted_launch("abc", "/home/you/it's here"),
+        r#"bash -c 'cd -- "$0" && claude --resume "$1"; exec bash -l' '/home/you/it'\''s here' 'abc'"#
+    );
+}
+
+/// Give a stub pane the shape of a resumable claude pane: a claude command, a
+/// minted session id, and a transcript on disk where `--resume` would find it.
+/// Everything lands in the test's state dir (Claude's home included, see
+/// `with_test_state_dir`), which is removed when the test ends.
+fn fake_claude_pane(eng: &mut Engine, slug: &str, tag: &str) {
+    let cwd = crate::state::state_dir()
+        .unwrap()
+        .join(format!("cwd-{tag}"));
+    std::fs::create_dir_all(&cwd).unwrap();
+    let cwd = cwd.to_string_lossy().to_string();
+    let session = format!("11111111-2222-4333-a444-{:012}", std::process::id());
+    let transcript = super::agent_session::claude_transcript(&cwd, &session);
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, b"{}\n").unwrap();
+
+    let p = eng.panes.iter_mut().find(|p| p.slug == slug).unwrap();
+    p.command = "claude --dangerously-skip-permissions".into();
+    p.cwd = cwd;
+    p.agent_session = Some(session);
+}
+
+// -- per-connection framing ---------------------------------------------------
+
+/// Frame kind as it lands on the wire, read back out of the encoded blob.
+#[derive(Debug, PartialEq, Eq)]
+enum Framing {
+    Full,
+    Damage,
+    Scroll,
+    HeaderOnly,
+}
+
+fn framing_of(ev: &GuiEvent) -> Framing {
+    use base64::Engine as _;
+    let GuiEvent::GridBin { data_b64, .. } = ev else {
+        panic!("expected a grid frame, got {ev:?}")
+    };
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(data_b64)
+        .unwrap();
+    let bytes = crate::runtime::snapshot::decompress_frame(&raw).unwrap();
+    let mut i = 4 + 1 + 8 + 8;
+    let flags = bytes[i];
+    i += 1;
+    if flags & 128 != 0 {
+        i += 2 + u16::from_le_bytes(bytes[i..i + 2].try_into().unwrap()) as usize;
+    }
+    i += 2 + u16::from_le_bytes(bytes[i..i + 2].try_into().unwrap()) as usize;
+    i += 1; // ghost flag
+    match bytes[i] {
+        0 => Framing::Full,
+        1 => {
+            if u16::from_le_bytes(bytes[i + 1..i + 3].try_into().unwrap()) == 0 {
+                Framing::HeaderOnly
+            } else {
+                Framing::Damage
+            }
+        }
+        2 => Framing::Scroll,
+        k => panic!("unknown frame kind {k}"),
+    }
+}
+
+fn grid_frames(g: &FakeGui) -> Vec<Framing> {
+    g.drain()
+        .iter()
+        .filter(|ev| matches!(ev, GuiEvent::GridBin { .. }))
+        .map(framing_of)
+        .collect()
+}
+
+fn synthetic_grid(
+    pane: &str,
+    rows: u16,
+    first_line: usize,
+) -> crate::runtime::snapshot::GridSnapshot {
+    use crate::runtime::snapshot::{CellSnap, GridSnapshot};
+    let cols = 40usize;
+    let mut snap = GridSnapshot::empty(pane);
+    snap.cols = cols as u16;
+    snap.rows = rows;
+    snap.rev = first_line as u64;
+    snap.cells = vec![CellSnap::blank(); cols * rows as usize];
+    for r in 0..rows as usize {
+        for (i, ch) in format!("line {:04}", first_line + r).chars().enumerate() {
+            snap.cells[r * cols + i].c = ch;
+        }
+    }
+    snap
+}
+
+/// The framing a window gets depends on what *that window* has been sent — not
+/// on what the least-caught-up window in the building needs.
+///
+/// This is the fix for the amplifier that made a remote window receive whole
+/// grids: the old code promoted a frame to FULL for everyone whenever any
+/// recipient lacked a damage base.
+#[test]
+fn a_window_that_just_attached_does_not_cost_the_others_a_full_grid() {
+    with_test_state_dir("gui-framing", || {
+        let scratch = temp_scratch("gui-framing");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let slug = eng.push_stub_pane("worker-a", "lab");
+
+        let g1 = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &g1.id, &["lab"]);
+        let _ = g1.drain();
+
+        // First frame for a window with no base: a whole grid, necessarily.
+        eng.broadcast_grid(synthetic_grid(&slug, 20, 0));
+        assert_eq!(grid_frames(&g1), vec![Framing::Full]);
+
+        // Second: one row changed, so row damage.
+        let mut next = synthetic_grid(&slug, 20, 0);
+        next.cells[3 * 40].c = 'Z';
+        eng.broadcast_grid(next);
+        assert_eq!(grid_frames(&g1), vec![Framing::Damage]);
+
+        // A second window attaches with no base for this pane.
+        let g2 = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &g2.id, &["lab"]);
+        let _ = g2.drain();
+
+        // The next frame is one row of change. The newcomer has to be sent a
+        // whole grid — and the established window still gets damage. This is
+        // the whole point: the two windows are framed independently.
+        let mut third = synthetic_grid(&slug, 20, 0);
+        third.cells[3 * 40].c = 'Z';
+        third.cells[5 * 40].c = 'Q';
+        eng.broadcast_grid(third);
+        assert_eq!(
+            grid_frames(&g1),
+            vec![Framing::Damage],
+            "the established window pays nothing for the newcomer"
+        );
+        assert_eq!(
+            grid_frames(&g2),
+            vec![Framing::Full],
+            "the newcomer needs a base"
+        );
+
+        // From here both take damage.
+        let mut fourth = synthetic_grid(&slug, 20, 0);
+        fourth.cells[3 * 40].c = 'Z';
+        fourth.cells[5 * 40].c = 'Q';
+        fourth.cells[7 * 40].c = 'W';
+        eng.broadcast_grid(fourth);
+        assert_eq!(grid_frames(&g1), vec![Framing::Damage]);
+        assert_eq!(grid_frames(&g2), vec![Framing::Damage]);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// Scrolling output is the dominant shape on an agent pane, and it must reach
+/// the wire as a shift plus the exposed rows — not a whole grid.
+#[test]
+fn scrolling_output_frames_as_a_scroll() {
+    with_test_state_dir("gui-scroll", || {
+        let scratch = temp_scratch("gui-scroll");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let slug = eng.push_stub_pane("worker-a", "lab");
+
+        let g1 = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &g1.id, &["lab"]);
+        let _ = g1.drain();
+
+        eng.broadcast_grid(synthetic_grid(&slug, 20, 0));
+        assert_eq!(grid_frames(&g1), vec![Framing::Full]);
+
+        // Every row now differs — the old code's cue to send a whole grid.
+        eng.broadcast_grid(synthetic_grid(&slug, 20, 6));
+        assert_eq!(grid_frames(&g1), vec![Framing::Scroll]);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// A spinner tick in the OSC title changes no cells. It used to cost a whole
+/// grid; it should cost a header.
+#[test]
+fn a_title_tick_frames_as_a_header() {
+    with_test_state_dir("gui-title", || {
+        let scratch = temp_scratch("gui-title");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let slug = eng.push_stub_pane("worker-a", "lab");
+
+        let g1 = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &g1.id, &["lab"]);
+        let _ = g1.drain();
+
+        let mut first = synthetic_grid(&slug, 20, 0);
+        first.title = Some("✳ idle".into());
+        eng.broadcast_grid(first);
+        assert_eq!(grid_frames(&g1), vec![Framing::Full]);
+
+        let mut spun = synthetic_grid(&slug, 20, 0);
+        spun.title = Some("⠋ working".into());
+        eng.broadcast_grid(spun);
+        assert_eq!(grid_frames(&g1), vec![Framing::HeaderOnly]);
+
+        // Nothing at all changed → nothing on the wire.
+        let mut same = synthetic_grid(&slug, 20, 0);
+        same.title = Some("⠋ working".into());
+        eng.broadcast_grid(same);
+        assert!(grid_frames(&g1).is_empty());
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// A window that stops watching a pane loses its damage base — the screen
+/// moves on without it, so the frames it missed are exactly what would make
+/// damage lie. Coming back must cost it one full grid, and nobody else
+/// anything.
+#[test]
+fn a_window_that_looks_away_gets_a_fresh_base_when_it_returns() {
+    with_test_state_dir("gui-rebase", || {
+        let scratch = temp_scratch("gui-rebase");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let slug = eng.push_stub_pane("worker-a", "lab");
+        eng.push_stub_pane("worker-b", "cadence");
+
+        let watcher = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &watcher.id, &["lab"]);
+        let looker = FakeGui::attach_to(&mut eng);
+        let _ = attach_with(&mut eng, &looker.id, &["lab", "cadence"]);
+        let (_, _) = (watcher.drain(), looker.drain());
+
+        eng.broadcast_grid(synthetic_grid(&slug, 20, 0));
+        assert_eq!(grid_frames(&watcher), vec![Framing::Full]);
+        assert_eq!(grid_frames(&looker), vec![Framing::Full]);
+
+        // The second window looks at another circle. Frames for "lab" keep
+        // flowing to the first one only.
+        let _ = eng.handle_gui(
+            GuiRequest::SetFocus {
+                pane: None,
+                workspace: Some("cadence".into()),
+            },
+            &looker.id,
+        );
+        let _ = looker.drain();
+        let mut moved = synthetic_grid(&slug, 20, 0);
+        moved.cells[2 * 40].c = 'A';
+        eng.broadcast_grid(moved);
+        assert_eq!(grid_frames(&watcher), vec![Framing::Damage]);
+        assert!(grid_frames(&looker).is_empty(), "not streaming it");
+
+        // Back to "lab": the returning window needs a whole grid, and the one
+        // that never looked away still gets damage.
+        let _ = eng.handle_gui(
+            GuiRequest::SetFocus {
+                pane: None,
+                workspace: Some("lab".into()),
+            },
+            &looker.id,
+        );
+        let _ = looker.drain();
+        let mut later = synthetic_grid(&slug, 20, 0);
+        later.cells[2 * 40].c = 'A';
+        later.cells[4 * 40].c = 'B';
+        eng.broadcast_grid(later);
+        assert_eq!(
+            grid_frames(&looker),
+            vec![Framing::Full],
+            "a stale base must not be trusted"
+        );
+        assert_eq!(grid_frames(&watcher), vec![Framing::Damage]);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// Attach tells the window the active scheme; `ctl theme` lists, refuses an
+/// unknown id with the choices, and a switch reaches every window and is
+/// saved in the state dir. Switches to the default so no other test sees a
+/// changed process-wide palette.
+#[test]
+fn theme_reaches_every_window_and_is_saved() {
+    with_test_state_dir("theme", || {
+        let (mut eng, _rx) = Engine::bare_for_test(temp_scratch("theme"));
+        let a = FakeGui::attach_to(&mut eng);
+        let b = FakeGui::attach_to(&mut eng);
+        eng.handle_gui(
+            GuiRequest::Attach {
+                selected_workspace: None,
+                focused_pane: None,
+                subscriptions: None,
+            },
+            &a.id,
+        );
+        let themes = |g: &FakeGui| -> Vec<String> {
+            g.drain()
+                .into_iter()
+                .filter_map(|ev| match ev {
+                    GuiEvent::Theme { id } => Some(id),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(themes(&a), [crate::looks::active().id]);
+        let _ = b.drain();
+
+        let theme = |id: Option<&str>| ControlRequest::Theme {
+            id: id.map(str::to_string),
+            scope: None,
+            from: None,
+        };
+        let list = eng.handle_control(theme(None));
+        assert!(list.ok);
+        assert_eq!(
+            list.data.as_ref().unwrap()["schemes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            seance_core::schemes::SCHEMES.len()
+        );
+
+        let bad = eng.handle_control(theme(Some("plaid")));
+        assert!(!bad.ok);
+        assert!(bad.error.unwrap().contains("ouija"));
+        assert!(themes(&b).is_empty());
+
+        let ok = eng.handle_control(theme(Some("Candlelit")));
+        assert!(ok.ok);
+        assert_eq!(ok.data.unwrap()["active"], "candlelit");
+        assert_eq!(themes(&a), ["candlelit"]);
+        assert_eq!(themes(&b), ["candlelit"]);
+        let saved =
+            std::fs::read_to_string(crate::runtime::state_data_dir().join("theme.json")).unwrap();
+        assert!(saved.contains("candlelit"));
+    });
+}
+
+/// Layouts end to end: the exact lines a GUI writes (a toggle click's
+/// `set_view`, a `ctl layout` wrapped in `ctl`) parse the way the daemon's
+/// reader parses them and are accepted; `ctl layout` lists each window's
+/// layout, refuses an unknown name, and a switch reaches every window.
+#[test]
+fn layout_lines_are_accepted_and_a_switch_reaches_every_window() {
+    with_test_state_dir("layout", || {
+        let (mut eng, _rx) = Engine::bare_for_test(temp_scratch("layout"));
+        let a = FakeGui::attach_to(&mut eng);
+        let b = FakeGui::attach_to(&mut eng);
+
+        // What `GuiClient::set_view` writes for a click on "stage".
+        let click = serde_json::to_string(&GuiRequest::SetView {
+            view: "stage".into(),
+        })
+        .unwrap();
+        assert_eq!(click, r#"{"op":"set_view","view":"stage"}"#);
+        let req: GuiRequest = serde_json::from_str(&click).expect("daemon parses the click");
+        assert!(eng.handle_gui(req, &a.id).is_none());
+
+        let layout = |name: Option<&str>| ControlRequest::Layout {
+            name: name.map(str::to_string),
+            scope: None,
+            from: None,
+        };
+        let by_window = |data: &serde_json::Value| -> Vec<(String, serde_json::Value)> {
+            data["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|w| (w["id"].as_str().unwrap().to_string(), w["layout"].clone()))
+                .collect()
+        };
+        let list = eng.handle_control(layout(None));
+        assert!(list.ok);
+        let data = list.data.unwrap();
+        assert_eq!(
+            data["layouts"],
+            serde_json::json!(["classic", "stage", "chat"])
+        );
+        assert_eq!(
+            by_window(&data),
+            [
+                (a.id.clone(), serde_json::json!("stage")),
+                (b.id.clone(), serde_json::Value::Null),
+            ]
+        );
+
+        let views = |g: &FakeGui| -> Vec<String> {
+            g.drain()
+                .into_iter()
+                .filter_map(|ev| match ev {
+                    GuiEvent::View { view } => Some(view),
+                    _ => None,
+                })
+                .collect()
+        };
+        let _ = (a.drain(), b.drain());
+        let bad = eng.handle_control(layout(Some("plaid")));
+        assert!(!bad.ok);
+        assert!(bad.error.unwrap().contains("classic, stage, chat"));
+        assert!(views(&a).is_empty() && views(&b).is_empty());
+
+        // `seance ctl layout Wall` as the GUI plane would carry it: the old
+        // name reaches every window as Chat.
+        let line = r#"{"op":"ctl","req":{"op":"layout","name":"Wall"}}"#;
+        let req: GuiRequest = serde_json::from_str(line).expect("daemon parses ctl layout");
+        match eng.handle_gui(req, &a.id) {
+            Some(GuiEvent::Ack { ok: true, data, .. }) => {
+                let data = data.unwrap();
+                // b never reported a layout (as a phone wouldn't), so it
+                // stays unlisted rather than claimed.
+                assert_eq!(
+                    by_window(&data),
+                    [
+                        (a.id.clone(), serde_json::json!("chat")),
+                        (b.id.clone(), serde_json::Value::Null),
+                    ]
+                );
+            }
+            other => panic!("ctl layout refused: {other:?}"),
+        }
+        assert_eq!(views(&a), ["chat"]);
+        assert_eq!(views(&b), ["chat"]);
+    });
+}
+
+/// Stage needs each circle's lead in State: the earliest terminal pane, an
+/// explicit `ctl lead` once set, and a fresh push the moment it changes.
+#[test]
+fn state_carries_each_circles_lead_and_ctl_lead_pushes_it() {
+    with_test_state_dir("gui-lead", || {
+        let scratch = temp_scratch("gui-lead");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let first = eng.push_stub_pane("first", "lab");
+        let second = eng.push_stub_pane("second", "lab");
+        let gui = FakeGui::attach_to(&mut eng);
+        attach_all(&mut eng, &gui.id);
+        gui.drain();
+
+        let lead_of = |gui: &FakeGui| {
+            gui.drain().into_iter().rev().find_map(|ev| match ev {
+                GuiEvent::State { workspace_meta, .. } => workspace_meta
+                    .into_iter()
+                    .find(|m| m.workspace == "lab")
+                    .map(|m| m.lead),
+                _ => None,
+            })
+        };
+        eng.push_state_to_all();
+        assert_eq!(lead_of(&gui), Some(Some(first.clone())));
+
+        let r = eng.handle_control(ControlRequest::Lead {
+            workspace: Some("lab".into()),
+            pane: Some(second.clone()),
+            scope: None,
+            from: None,
+        });
+        assert!(r.error.is_none(), "{:?}", r.error);
+        // No manual push here: the lead change itself must reach the window.
+        assert_eq!(lead_of(&gui), Some(Some(second)));
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}
+
+/// An agent that marked itself blocked and starts a turn right after you
+/// typed in its pane was answered, so its "needs you" clears to working. A turn
+/// nobody typed for (a pane message, a finished background job) keeps the
+/// flag, and other states never move.
+#[test]
+fn a_turn_you_typed_for_clears_a_blocked_status() {
+    with_test_state_dir("gui-answered", || {
+        let scratch = temp_scratch("gui-answered");
+        let (mut eng, _rx) = Engine::bare_for_test(scratch.clone());
+        let asked = eng.push_stub_pane("asked", "lab");
+        let unprompted = eng.push_stub_pane("unprompted", "lab");
+        let finished = eng.push_stub_pane("finished", "lab");
+        eng.statuses
+            .insert(asked.clone(), ("blocked".into(), Some("need logs".into())));
+        eng.statuses
+            .insert(unprompted.clone(), ("needs-human".into(), None));
+        eng.statuses.insert(finished.clone(), ("done".into(), None));
+        for p in eng.panes.iter_mut().filter(|p| p.slug != unprompted) {
+            p.agency.last_human_input = Some(std::time::Instant::now());
+        }
+
+        for slug in [&asked, &unprompted, &finished] {
+            eng.handle_session_event(SessionEvent::Title {
+                slug: slug.clone(),
+                title: Some("\u{2809} thinking".into()),
+            });
+        }
+
+        let state = |s: &String| eng.statuses.get(s).map(|(st, _)| st.clone());
+        assert_eq!(state(&asked).as_deref(), Some("working"));
+        assert_eq!(state(&unprompted).as_deref(), Some("needs-human"));
+        assert_eq!(state(&finished).as_deref(), Some("done"));
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    });
+}

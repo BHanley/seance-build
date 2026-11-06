@@ -1,0 +1,1193 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#131111" />
+    <title>seance</title>
+    <link rel="stylesheet" href="./style.css" />
+    <link rel="icon" href="./icon-192.png" />
+
+    <!-- Home-screen install. `black-translucent` puts the web view under the
+         status bar, which is why #topbar carries a safe-area-inset-top pad —
+         without it the circle name sits behind the clock. -->
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="./icon-180.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="seance" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- Token gate. Hidden until ui::Chrome::show_login is called. -->
+      <div id="login" hidden>
+        <div id="login-card">
+          <div id="login-mark">seance</div>
+          <div id="login-sub">a circle of agents, one shared room</div>
+          <label class="field-label" for="login-token">access token</label>
+          <input id="login-token" type="password" placeholder="••••••••••••" spellcheck="false" />
+          <button id="login-join" type="button">join the circle</button>
+          <div id="login-error" class="hidden"></div>
+        </div>
+      </div>
+
+      <div id="topbar"></div>
+      <div id="asks"></div>
+      <div id="sidebar"></div>
+      <div id="awaken"></div>
+      <div id="tiles"></div>
+      <div id="toasts"></div>
+    </div>
+
+
+    <script type="module">
+      import init, {
+        seance_mobile_text,
+        seance_mobile_key,
+        seance_mobile_cycle_workspace,
+        seance_mobile_scroll,
+        seance_mobile_url_at,
+        seance_mobile_rename_workspace,
+        seance_mobile_is_pinned,
+        seance_mobile_set_pinned,
+        seance_mobile_scroll_bottom,
+        seance_mobile_banish_workspace,
+        seance_mobile_circle_modes,
+        seance_mobile_set_circle_mode,
+        seance_mobile_spaces,
+        seance_mobile_move_to_space,
+      } from './seance_web.js';
+      await init();
+      // The phone chrome below is plain JS and can't reach the websocket —
+      // the wasm owns it. These are the seam (see lib.rs).
+      window.seanceMobile = {
+        text: seance_mobile_text,
+        key: seance_mobile_key,
+        cycle: seance_mobile_cycle_workspace,
+        scroll: seance_mobile_scroll,
+        urlAt: seance_mobile_url_at,
+        rename: seance_mobile_rename_workspace,
+        isPinned: seance_mobile_is_pinned,
+        setPinned: seance_mobile_set_pinned,
+        toBottom: seance_mobile_scroll_bottom,
+        banish: seance_mobile_banish_workspace,
+        circleModes: seance_mobile_circle_modes,
+        setCircleMode: seance_mobile_set_circle_mode,
+        spaces: seance_mobile_spaces,
+        moveToSpace: seance_mobile_move_to_space,
+      };
+      window.dispatchEvent(new Event('seance-ready'));
+    </script>
+
+    <script>
+      // ── phone chrome ───────────────────────────────────────────────────
+      // Drawer, keyboard surface (system keyboard + accessory bar),
+      // voice-to-prompt, swipe-between-circles.
+      //
+      // All of it hangs off <body>: ui.rs calls set_inner_html("") on #topbar
+      // and #sidebar every re-render and would eat anything parented there.
+      // CSS (max-width: 820px) decides what's visible, so on desktop this
+      // whole file is inert.
+      (function () {
+        'use strict';
+
+        var body = document.body;
+        function mk(tag, id, cls, text) {
+          var e = document.createElement(tag);
+          if (id) e.id = id;
+          if (cls) e.className = cls;
+          if (text != null) e.textContent = text;
+          return e;
+        }
+        function mobile() {
+          return window.matchMedia('(max-width: 820px), (pointer: coarse) and (hover: none)').matches;
+        }
+        function toast(msg) {
+          var t = document.getElementById('m-toast');
+          if (!t) {
+            t = mk('div', 'm-toast');
+            body.appendChild(t);
+          }
+          t.textContent = msg;
+          t.classList.add('show');
+          clearTimeout(t._h);
+          t._h = setTimeout(function () {
+            t.classList.remove('show');
+          }, 3000);
+        }
+
+        // ── accessory bar layout ──────────────────────────────────────────
+        // One row, data-driven. Adding a key is one entry:
+        //   {k:'F5'}                     → named key (map_key_name names)
+        //   {k:'c', label:'^C', ctrl:1}  → one-shot combo
+        //   {mod:'ctrl'}                 → sticky modifier
+        // The encoder already understands every name map_key_name accepts, so
+        // nothing below needs a Rust change. Shift+enter is a newline that
+        // does not submit (agent prompts). Stop is esc, which interrupts an
+        // agent; keep:1 leaves the typed line unsent. nav:1 drops the
+        // keyboard and opens the circle list, since the ☰ button hides with
+        // the keyboard up.
+        var ROWS = [
+          [
+            { nav: 1, label: '☰' },
+            { k: 'Escape', label: '■ stop', keep: 1 },
+            { k: 'ArrowLeft', label: '←' },
+            { k: 'ArrowDown', label: '↓' },
+            { k: 'ArrowUp', label: '↑' },
+            { k: 'ArrowRight', label: '→' },
+            { k: 'Enter', shift: 1, label: '⇧⏎' },
+          ],
+        ];
+
+        var mods = { ctrl: false, alt: false, shift: false };
+
+        function sendKey(name, extraCtrl, extraAlt, extraShift) {
+          if (!window.seanceMobile) return false;
+          var ok = window.seanceMobile.key(
+            name,
+            !!(mods.ctrl || extraCtrl),
+            !!(mods.alt || extraAlt),
+            !!(mods.shift || extraShift)
+          );
+          if (!ok) toast('no pane focused — tap a terminal first');
+          clearMods();
+          return ok;
+        }
+        function clearMods() {
+          var changed = mods.ctrl || mods.alt || mods.shift;
+          mods.ctrl = mods.alt = mods.shift = false;
+          if (changed) paintMods();
+        }
+        function paintMods() {
+          [].forEach.call(document.querySelectorAll('.m-acc-key[data-mod]'), function (b) {
+            b.classList.toggle('on', !!mods[b.getAttribute('data-mod')]);
+          });
+        }
+
+        // ── button cluster ────────────────────────────────────────────────
+        var bar = mk('div', 'm-bar');
+        var navBtn = mk('button', 'm-nav', 'm-btn', '☰');
+        navBtn.type = 'button';
+        navBtn.setAttribute('aria-label', 'workspaces');
+        var kbBtn = mk('button', 'm-kb-btn', 'm-btn', '⌨');
+        kbBtn.type = 'button';
+        kbBtn.setAttribute('aria-label', 'keyboard');
+        var micBtn = mk('button', 'm-mic', 'm-btn', '●');
+        micBtn.type = 'button';
+        micBtn.setAttribute('aria-label', 'voice prompt');
+        // Jump to the live tail. Present only while the focused pane is
+        // scrolled back: the wasm puts `data-scrolled` on <body> once per
+        // frame (`sync_scroll_chip`) and the CSS does the rest, so there is no
+        // state to keep in here and nothing to poll.
+        var botBtn = mk('button', 'm-bottom', 'm-btn', '↓');
+        botBtn.type = 'button';
+        botBtn.setAttribute('aria-label', 'jump to the bottom');
+        botBtn.addEventListener('click', function (e) {
+          e.preventDefault();
+          if (!window.seanceMobile || !window.seanceMobile.toBottom()) {
+            toast('no pane focused — tap a terminal first');
+          }
+        });
+        bar.appendChild(navBtn);
+        bar.appendChild(kbBtn);
+        bar.appendChild(micBtn);
+        bar.appendChild(botBtn);
+        body.appendChild(bar);
+
+        // ── drawer ────────────────────────────────────────────────────────
+        function setNav(open) {
+          body.classList.toggle('m-nav-open', open);
+          navBtn.textContent = open ? '✕' : '☰';
+          navBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+        }
+        navBtn.addEventListener('click', function (e) {
+          e.preventDefault();
+          if (kbOpen()) closeKb();
+          setNav(!body.classList.contains('m-nav-open'));
+        });
+        document.getElementById('sidebar').addEventListener('click', function (e) {
+          var t = e.target;
+          if (!t || !t.closest) return;
+          if (t.closest('.ws-banish')) return; // destructive — don't also dismiss
+          if (t.closest('input, textarea')) return; // inline rename
+          if (t.closest('.ws-row, .ql-chip, .foot-summon')) setNav(false);
+        }, true); // capture: ql-chip's wasm handler stops propagation
+
+        // ── circle menu ───────────────────────────────────────────────────
+        // The topbar packs title + connection + probe into 390px,
+        // and the title lost — "free-premium-rp" wrapped to three lines and
+        // shoved the terminal down. On mobile the title gets the whole bar and
+        // everything else moves in here, reached by tapping the title.
+        var menu = mk('div', 'm-menu');
+        menu.hidden = true;
+        var menuTitle = mk('div', 'm-menu-title', null, '');
+        // Rename lives here because the desktop's two spellings — double-click
+        // a rail row, or its right-click menu — are both unreachable from a
+        // finger. Renaming moves the LABEL only; the slug is the circle.
+        var menuNameHead = mk('div', null, 'm-menu-sec', 'name');
+        var menuName = mk('div', 'm-menu-name');
+        var nameInput = document.createElement('input');
+        nameInput.id = 'm-menu-name-input';
+        nameInput.type = 'text';
+        nameInput.setAttribute('autocomplete', 'off');
+        nameInput.setAttribute('autocorrect', 'off');
+        nameInput.setAttribute('autocapitalize', 'none');
+        nameInput.setAttribute('spellcheck', 'false');
+        nameInput.setAttribute('enterkeyhint', 'done');
+        nameInput.setAttribute('aria-label', 'circle name');
+        var nameSave = mk('button', 'm-menu-rename', 'm-sheet-btn', 'rename');
+        nameSave.type = 'button';
+        menuName.appendChild(nameInput);
+        menuName.appendChild(nameSave);
+        // Pin + space moves: the desktop's are a right-click on a rail row,
+        // which a finger has no spelling for.
+        var menuRailHead = mk('div', null, 'm-menu-sec', 'rail');
+        var pinBtn = mk('button', 'm-menu-pin', 'm-sheet-btn', 'pin');
+        pinBtn.type = 'button';
+        // Host circle modes (AFK) — one toggle each, only when host.json
+        // defines any. The daemon prompts the circle's first pane.
+        var modeBtns = mk('div', 'm-menu-modes');
+        var menuSpacesHead = mk('div', null, 'm-menu-sec', 'move to space');
+        var spaceBtns = mk('div', 'm-menu-spaces');
+        var menuConnHead = mk('div', null, 'm-menu-sec', 'connection');
+        var menuConn = mk('div', 'm-menu-conn', null, '');
+        // Destructive, so it sits at the bottom, away from the controls you
+        // reach for every day — and it arms before it fires, the same two-tap
+        // the rail row's × uses.
+        var menuDangerHead = mk('div', null, 'm-menu-sec', 'danger');
+        var banishBtn = mk('button', 'm-menu-banish', 'm-sheet-btn', 'banish circle');
+        banishBtn.type = 'button';
+        var menuClose = mk('button', 'm-menu-close', 'm-sheet-btn', 'close');
+        menuClose.type = 'button';
+        [
+          menuTitle,
+          menuNameHead,
+          menuName,
+          menuRailHead,
+          pinBtn,
+          modeBtns,
+          menuSpacesHead,
+          spaceBtns,
+          menuConnHead,
+          menuConn,
+          menuDangerHead,
+          banishBtn,
+          menuClose,
+        ].forEach(function (el) {
+          menu.appendChild(el);
+        });
+        body.appendChild(menu);
+
+        function commitRename() {
+          var v = nameInput.value.trim();
+          nameInput.blur();
+          if (!v || v === menuTitle.textContent) return;
+          if (!window.seanceMobile || !window.seanceMobile.rename(v)) {
+            toast('no circle selected');
+            return;
+          }
+          // The daemon echoes a fresh state and the topbar repaints from it;
+          // this is just so the sheet you are looking at isn't stale.
+          menuTitle.textContent = v;
+          toast('renamed');
+        }
+        // Two-tap arm. The window is deliberately short: an armed destructive
+        // button you forgot about is the thing to avoid.
+        var banishArm = null;
+        function disarmBanish() {
+          clearTimeout(banishArm);
+          banishArm = null;
+          banishBtn.textContent = 'banish circle';
+          banishBtn.classList.remove('armed');
+        }
+        banishBtn.addEventListener('click', function (e) {
+          e.preventDefault();
+          if (!banishArm) {
+            banishBtn.textContent = 'tap again to banish';
+            banishBtn.classList.add('armed');
+            banishArm = setTimeout(disarmBanish, 3000);
+            return;
+          }
+          disarmBanish();
+          var label = window.seanceMobile && window.seanceMobile.banish();
+          if (!label) {
+            toast('no circle selected');
+            return;
+          }
+          closeMenu();
+          toast('banished ' + label);
+        });
+
+        function paintPin() {
+          var on = window.seanceMobile ? window.seanceMobile.isPinned() : undefined;
+          // undefined = no circle selected; leave the control out entirely
+          // rather than showing one that does nothing.
+          pinBtn.hidden = on === undefined;
+          menuRailHead.hidden = on === undefined;
+          pinBtn.textContent = on ? 'unpin' : 'pin';
+          pinBtn.classList.toggle('on', !!on);
+          paintModes();
+          paintSpaces();
+        }
+        function paintSpaces() {
+          spaceBtns.textContent = '';
+          var spaces = [];
+          try {
+            spaces = window.seanceMobile ? JSON.parse(window.seanceMobile.spaces()) : [];
+          } catch (_) {}
+          var others = spaces.filter(function (s) { return !s.here; });
+          menuSpacesHead.hidden = others.length === 0;
+          others.forEach(function (s) {
+            var b = mk('button', null, 'm-sheet-btn', s.name);
+            b.type = 'button';
+            b.addEventListener('click', function (e) {
+              e.preventDefault();
+              if (window.seanceMobile && window.seanceMobile.moveToSpace(s.id)) {
+                paintSpaces();
+                toast('moved to ' + s.name);
+              }
+            });
+            spaceBtns.appendChild(b);
+          });
+        }
+        function paintModes() {
+          modeBtns.textContent = '';
+          var modes = [];
+          try {
+            modes = window.seanceMobile ? JSON.parse(window.seanceMobile.circleModes()) : [];
+          } catch (_) {}
+          modes.forEach(function (m) {
+            var b = mk('button', null, 'm-sheet-btn m-menu-mode', m.on ? m.off_label : m.on_label);
+            b.type = 'button';
+            b.classList.toggle('on', !!m.on);
+            b.addEventListener('click', function (e) {
+              e.preventDefault();
+              if (!window.seanceMobile.setCircleMode(m.id, !m.on)) {
+                toast('no circle selected');
+                return;
+              }
+              paintModes();
+              toast(m.on ? m.label + ' off' : m.label + ' on');
+            });
+            modeBtns.appendChild(b);
+          });
+        }
+        pinBtn.addEventListener('click', function (e) {
+          e.preventDefault();
+          if (!window.seanceMobile) return;
+          var was = window.seanceMobile.isPinned();
+          if (was === undefined) return;
+          var now = window.seanceMobile.setPinned(!was);
+          paintPin();
+          toast(now ? 'pinned' : 'unpinned');
+        });
+        nameSave.addEventListener('click', function (e) {
+          e.preventDefault();
+          commitRename();
+        });
+        // Select-all on focus, like the desktop's inline rename: a rename is
+        // usually a replacement, and re-tapping the field drops the selection
+        // when it isn't. iOS wants it off the focus turn, not in it.
+        nameInput.addEventListener('focus', function () {
+          setTimeout(function () {
+            try {
+              nameInput.select();
+            } catch (e) {}
+          }, 0);
+        });
+        nameInput.addEventListener('keydown', function (e) {
+          // The document keymap and the PTY must never see this typing.
+          e.stopPropagation();
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            commitRename();
+          } else if (e.key === 'Escape') {
+            e.preventDefault();
+            nameInput.value = menuTitle.textContent;
+            nameInput.blur();
+          }
+        });
+
+        function openMenu() {
+          var t = document.querySelector('.tb-title');
+          menuTitle.textContent = t ? t.textContent : '';
+          nameInput.value = menuTitle.textContent;
+          paintPin();
+          var lbl = document.getElementById('conn-label');
+          var dot = document.getElementById('conn-dot');
+          menuConn.textContent = (lbl && lbl.textContent) || 'unknown';
+          menuConn.className = dot && dot.classList.contains('bad') ? 'bad' : '';
+          menu.hidden = false;
+          body.classList.add('m-menu-open');
+        }
+        function closeMenu() {
+          disarmBanish();
+          menu.hidden = true;
+          body.classList.remove('m-menu-open');
+        }
+        menuClose.addEventListener('click', function (e) {
+          e.preventDefault();
+          closeMenu();
+        });
+        // Delegated: #topbar survives re-renders, its children do not.
+        document.getElementById('topbar').addEventListener('click', function (e) {
+          if (!mobile()) return;
+          var t = e.target;
+          if (!t || !t.closest) return;
+          if (!t.closest('.tb-title')) return;
+          e.preventDefault();
+          if (menu.hidden) openMenu();
+          else closeMenu();
+        });
+
+        // ── keyboard surface ──────────────────────────────────────────────
+        // The catcher is a visible line on top of the accessory bar. Typed
+        // text stays in it until Enter, so the phone keyboard's own word
+        // composition, touch selection and delete all work, then the whole
+        // line goes to the pane. With the line empty, Enter and Backspace go
+        // straight to the pane.
+        //
+        // ui.rs's on_keydown bails when the active element is an INPUT or
+        // TEXTAREA, so while this is focused the wasm ignores the keyboard
+        // entirely and every keystroke arrives here exactly once.
+        var acc = mk('div', 'm-acc');
+        acc.hidden = true;
+        var accRows = mk('div', null, 'm-acc-rows');
+        var catcher = document.createElement('input');
+        catcher.id = 'm-catch';
+        catcher.type = 'text';
+        catcher.setAttribute('autocomplete', 'off');
+        catcher.setAttribute('autocorrect', 'off');
+        catcher.setAttribute('autocapitalize', 'none');
+        catcher.setAttribute('spellcheck', 'false');
+        catcher.setAttribute('enterkeyhint', 'send');
+        catcher.setAttribute('aria-label', 'terminal input');
+        catcher.setAttribute('placeholder', 'type, enter sends');
+        // lib.rs sends any `paste` on the document straight to the focused
+        // pane; a paste into the line should wait for Enter like typing.
+        catcher.addEventListener('paste', function (e) {
+          e.stopPropagation();
+        });
+        var composing = false;
+        catcher.addEventListener('compositionstart', function () {
+          composing = true;
+        });
+        catcher.addEventListener('compositionend', function () {
+          composing = false;
+        });
+
+        // Sends whatever is waiting in the catcher, so keys like tab and the
+        // arrows act after the text that was typed before them.
+        function flushLine() {
+          var v = catcher.value;
+          if (!v) return true;
+          catcher.value = '';
+          // Mid-word, the keyboard still holds the old text and would type it
+          // again; refocusing makes it start a fresh word.
+          if (composing) {
+            catcher.blur();
+            catcher.focus();
+          }
+          if (window.seanceMobile && window.seanceMobile.text(v, false)) return true;
+          catcher.value = v;
+          toast('no pane focused — tap a terminal first');
+          return false;
+        }
+
+        function accKey(spec) {
+          var b = mk('button', null, 'm-acc-key', spec.label || spec.k);
+          b.type = 'button';
+          if (spec.mod) b.setAttribute('data-mod', spec.mod);
+          // pointerdown, not click: the catcher must never lose focus, or iOS
+          // dismisses the keyboard and the bar drops with it.
+          b.addEventListener('pointerdown', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (spec.nav) {
+              closeKb();
+              setNav(true);
+              return;
+            }
+            if (spec.mod) {
+              mods[spec.mod] = !mods[spec.mod];
+              paintMods();
+              return;
+            }
+            if (spec.keep || flushLine()) sendKey(spec.k, spec.ctrl, spec.alt, spec.shift);
+          });
+          return b;
+        }
+        ROWS.forEach(function (row) {
+          var r = mk('div', null, 'm-acc-row');
+          row.forEach(function (spec) {
+            r.appendChild(accKey(spec));
+          });
+          accRows.appendChild(r);
+        });
+        var accDone = mk('button', 'm-acc-done', 'm-acc-key wide', 'done');
+        accDone.type = 'button';
+        accDone.addEventListener('pointerdown', function (e) {
+          e.preventDefault();
+          closeKb();
+        });
+        var accRight = mk('div', null, 'm-acc-right');
+        accRight.appendChild(accDone);
+        acc.appendChild(accRows);
+        acc.appendChild(accRight);
+        acc.appendChild(catcher);
+        body.appendChild(acc);
+
+        function kbOpen() {
+          return body.classList.contains('m-kb-open');
+        }
+        function openKb() {
+          setNav(false);
+          acc.hidden = false;
+          body.classList.add('m-kb-open');
+          kbBtn.classList.add('on');
+          catcher.focus();
+        }
+        function closeKb() {
+          catcher.blur();
+          acc.hidden = true;
+          body.classList.remove('m-kb-open');
+          kbBtn.classList.remove('on');
+          clearMods();
+          applyInsets();
+        }
+        kbBtn.addEventListener('click', function (e) {
+          e.preventDefault();
+          if (kbOpen()) closeKb();
+          else openKb();
+        });
+
+        // ── link sheet ────────────────────────────────────────────────────
+        // A tap on a URL in a pane lands here rather than opening straight
+        // away: taps on a terminal are how you focus a pane, so a mis-hit
+        // would throw you out to the browser mid-session. The sheet is also
+        // where `copy` lives, which on a phone is the more useful half.
+        var linkSheet = mk('div', 'm-link');
+        linkSheet.hidden = true;
+        var linkCard = mk('div', 'm-link-card');
+        var linkHead = mk('div', 'm-link-head', null, 'link');
+        var linkUrl = mk('div', 'm-link-url', null, '');
+        var linkBar = mk('div', 'm-link-bar');
+        var linkCancel = mk('button', 'm-link-cancel', 'm-sheet-btn', 'cancel');
+        linkCancel.type = 'button';
+        var linkCopy = mk('button', 'm-link-copy', 'm-sheet-btn', 'copy');
+        linkCopy.type = 'button';
+        var linkOpen = mk('button', 'm-link-open', 'm-sheet-btn primary', 'open');
+        linkOpen.type = 'button';
+        [linkCancel, linkCopy, linkOpen].forEach(function (b) {
+          linkBar.appendChild(b);
+        });
+        [linkHead, linkUrl, linkBar].forEach(function (el) {
+          linkCard.appendChild(el);
+        });
+        linkSheet.appendChild(linkCard);
+        body.appendChild(linkSheet);
+
+        var linkHref = '';
+        function openLinkSheet(url) {
+          linkHref = url;
+          linkUrl.textContent = url;
+          linkSheet.hidden = false;
+          body.classList.add('m-link-open');
+        }
+        function closeLinkSheet() {
+          linkSheet.hidden = true;
+          body.classList.remove('m-link-open');
+          linkHref = '';
+        }
+        linkSheet.addEventListener('click', function (e) {
+          if (e.target === linkSheet) closeLinkSheet(); // backdrop
+        });
+        linkCancel.addEventListener('click', function (e) {
+          e.preventDefault();
+          closeLinkSheet();
+        });
+        linkCopy.addEventListener('click', function (e) {
+          e.preventDefault();
+          var url = linkHref;
+          closeLinkSheet();
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(url).then(
+              function () {
+                toast('copied');
+              },
+              function () {
+                toast('clipboard refused — needs the https url');
+              }
+            );
+          } else {
+            toast('clipboard needs https — use the seance.ham.xyz url');
+          }
+        });
+        linkOpen.addEventListener('click', function (e) {
+          e.preventDefault();
+          var url = linkHref;
+          closeLinkSheet();
+          // Straight out of the tap, so it still counts as a user gesture.
+          // No feature string: passing 'noopener' makes window.open return
+          // null even when it DID open the tab, and the fallback below then
+          // opens a second one. Sever the opener afterwards instead.
+          var w = null;
+          try {
+            w = window.open(url, '_blank');
+          } catch (err) {}
+          if (w) {
+            try {
+              w.opener = null;
+            } catch (err) {}
+            return;
+          }
+          var a = document.createElement('a');
+          a.href = url;
+          a.target = '_blank';
+          a.rel = 'noopener noreferrer';
+          a.style.display = 'none';
+          body.appendChild(a);
+          a.click();
+          a.remove();
+        });
+
+        // Typed characters stay in the catcher (see above). Clearing it after
+        // every character fought Android's word composition and doubled
+        // letters. Soft keyboards often skip keydown (keyCode 229), so Enter
+        // and an empty-line Backspace are also caught as inputTypes.
+        function sendLine() {
+          if (flushLine()) sendKey('Enter');
+        }
+        catcher.addEventListener('beforeinput', function (e) {
+          if (e.inputType === 'deleteContentBackward' && !catcher.value) {
+            e.preventDefault();
+            sendKey('Backspace');
+          } else if (e.inputType === 'insertLineBreak') {
+            e.preventDefault();
+            sendLine();
+          }
+        });
+        catcher.addEventListener('input', function () {
+          // A modifier is armed → the character just typed is a combo.
+          if (!(mods.ctrl || mods.alt) || !catcher.value) return;
+          var v = catcher.value;
+          catcher.value = v.slice(0, -1);
+          if (flushLine()) sendKey(v.slice(-1));
+        });
+        // Hardware keyboards (and the ⏎ on the software one) do fire keydown.
+        catcher.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            sendLine();
+          } else if (e.key === 'Backspace' && !catcher.value) {
+            // A held Backspace that just emptied the line stops there.
+            e.preventDefault();
+            if (!e.repeat) sendKey('Backspace');
+          } else if (e.key === 'Escape') {
+            e.preventDefault();
+            sendKey('Escape');
+          }
+        });
+        // iOS can dismiss the keyboard without telling us (swipe-down, form
+        // bar "Done"); the blur is the only signal, so mirror our state to it.
+        catcher.addEventListener('blur', function () {
+          if (kbOpen()) setTimeout(function () {
+            // A tap on a pane refocuses the catcher on its click.
+            if (Date.now() - kbAfterClick < 600) return;
+            if (document.activeElement !== catcher && kbOpen()) closeKb();
+          }, 60);
+        });
+
+        // ── viewport insets ───────────────────────────────────────────────
+        // THIS is what makes the pane resize instead of hiding behind the
+        // keyboard. visualViewport shrinks by exactly the keyboard height, so
+        // #app gets that height minus the accessory bar and the existing
+        // sync_sizes() → Resize path reflows the PTY for free.
+        var vv = window.visualViewport;
+        function applyInsets() {
+          var h = vv ? vv.height : window.innerHeight;
+          var accH = kbOpen() && !acc.hidden ? acc.getBoundingClientRect().height : 0;
+          var avail = Math.max(120, Math.round(h - accH));
+          document.documentElement.style.setProperty('--m-vh', avail + 'px');
+          if (kbOpen()) {
+            // Keyboard height, measured — not guessed at from a device table.
+            var kb = Math.max(0, Math.round(window.innerHeight - h - (vv ? vv.offsetTop : 0)));
+            acc.style.bottom = kb + 'px';
+          } else {
+            acc.style.bottom = '';
+          }
+        }
+        if (vv) {
+          vv.addEventListener('resize', applyInsets);
+          vv.addEventListener('scroll', applyInsets);
+        }
+        window.addEventListener('resize', applyInsets);
+        window.addEventListener('orientationchange', function () {
+          setTimeout(applyInsets, 250);
+        });
+        applyInsets();
+
+        // ── voice → prompt ────────────────────────────────────────────────
+        // The recording is the expensive thing here: you spoke it once, on a
+        // phone, possibly with no reception. So the blob is held in memory and
+        // NOTHING auto-discards it — every failure path lands on a sheet that
+        // still owns the audio and offers retry. Upload uses XHR rather than
+        // fetch purely for upload.onprogress; fetch cannot report bytes sent.
+        var voice = {
+          blob: null,
+          ext: 'webm',
+          durMs: 0,
+          xhr: null,
+          state: 'idle', // idle | uploading | transcribing | error | ready
+          error: '',
+          sent: 0,
+          total: 0,
+          startedAt: 0,
+          tick: null,
+        };
+
+        function fmtBytes(n) {
+          if (!n && n !== 0) return '—';
+          if (n < 1024) return n + ' B';
+          if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
+          return (n / 1024 / 1024).toFixed(1) + ' MB';
+        }
+        function fmtClock(ms) {
+          var s = Math.max(0, Math.round(ms / 1000));
+          return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+        }
+
+        var sheet = mk('div', 'm-sheet');
+        sheet.hidden = true;
+        var sheetHead = mk('div', 'm-sheet-head', null, 'voice prompt');
+        var fileRow = mk('div', 'm-file');
+        var fileName = mk('span', null, 'm-file-name', 'voice');
+        var fileMeta = mk('span', null, 'm-file-meta', '');
+        fileRow.appendChild(fileName);
+        fileRow.appendChild(fileMeta);
+        var barWrap = mk('div', 'm-prog');
+        var barFill = mk('div', 'm-prog-fill');
+        barWrap.appendChild(barFill);
+        var statusRow = mk('div', 'm-status', null, '');
+        var errBox = mk('div', 'm-err');
+        errBox.hidden = true;
+        var ta = mk('textarea', 'm-text');
+        ta.setAttribute('rows', '8');
+        var sheetBar = mk('div', 'm-sheet-bar');
+        var discard = mk('button', 'm-discard', 'm-sheet-btn', 'discard');
+        discard.type = 'button';
+        var primary = mk('button', 'm-send', 'm-sheet-btn primary', 'send');
+        primary.type = 'button';
+        sheetBar.appendChild(discard);
+        sheetBar.appendChild(primary);
+        [sheetHead, fileRow, barWrap, statusRow, errBox, ta, sheetBar].forEach(function (el) {
+          sheet.appendChild(el);
+        });
+        body.appendChild(sheet);
+
+        function renderSheet() {
+          var v = voice;
+          var busy = v.state === 'uploading' || v.state === 'transcribing';
+          sheet.hidden = false;
+          body.classList.add('m-sheet-open');
+
+          fileName.textContent = 'voice.' + v.ext;
+          fileMeta.textContent =
+            fmtBytes(v.blob ? v.blob.size : 0) + ' · ' + fmtClock(v.durMs) + ' recorded';
+
+          var elapsed = v.startedAt ? Date.now() - v.startedAt : 0;
+          if (v.state === 'uploading') {
+            var pct = v.total ? Math.min(100, Math.round((v.sent / v.total) * 100)) : 0;
+            barWrap.hidden = false;
+            barWrap.classList.remove('indet');
+            barFill.style.width = pct + '%';
+            sheetHead.textContent = 'uploading';
+            statusRow.textContent =
+              fmtBytes(v.sent) + ' / ' + fmtBytes(v.total) + ' · ' + pct + '% · ' + fmtClock(elapsed);
+          } else if (v.state === 'transcribing') {
+            barWrap.hidden = false;
+            barWrap.classList.add('indet');
+            barFill.style.width = '100%';
+            sheetHead.textContent = 'transcribing';
+            statusRow.textContent = 'uploaded ' + fmtBytes(v.total) + ' · waiting on groq · ' + fmtClock(elapsed);
+          } else {
+            barWrap.hidden = true;
+            barWrap.classList.remove('indet');
+            statusRow.textContent = v.state === 'ready' ? 'transcribed — edit and send' : '';
+            sheetHead.textContent = v.state === 'error' ? 'transcription failed' : 'voice prompt';
+          }
+
+          errBox.hidden = v.state !== 'error';
+          errBox.textContent = v.error || '';
+
+          ta.hidden = v.state !== 'ready';
+          ta.disabled = v.state !== 'ready';
+
+          // Left is always discard. Right is send when there's text to send,
+          // retry otherwise — including mid-upload, where retry means "cancel
+          // this attempt and start it again".
+          if (v.state === 'ready') {
+            primary.textContent = 'send';
+            primary.classList.add('primary');
+            primary.disabled = false;
+          } else {
+            primary.textContent = 'retry';
+            primary.classList.remove('primary');
+            primary.disabled = !v.blob;
+          }
+        }
+
+        function startTick() {
+          stopTick();
+          voice.tick = setInterval(function () {
+            if (voice.state === 'uploading' || voice.state === 'transcribing') renderSheet();
+            else stopTick();
+          }, 250);
+        }
+        function stopTick() {
+          if (voice.tick) {
+            clearInterval(voice.tick);
+            voice.tick = null;
+          }
+        }
+
+        function closeSheet() {
+          abortUpload();
+          stopTick();
+          voice.blob = null;
+          voice.state = 'idle';
+          voice.error = '';
+          sheet.hidden = true;
+          body.classList.remove('m-sheet-open');
+          ta.value = '';
+        }
+        function abortUpload() {
+          if (voice.xhr) {
+            var x = voice.xhr;
+            voice.xhr = null;
+            try {
+              x.abort();
+            } catch (e) {}
+          }
+        }
+
+        function failVoice(msg) {
+          voice.state = 'error';
+          voice.error = msg;
+          stopTick();
+          renderSheet();
+        }
+
+        function uploadVoice() {
+          if (!voice.blob) return;
+          abortUpload();
+          var tok = '';
+          try {
+            tok = localStorage.getItem('seance_token') || '';
+          } catch (e) {}
+          voice.state = 'uploading';
+          voice.error = '';
+          voice.sent = 0;
+          voice.total = voice.blob.size;
+          voice.startedAt = Date.now();
+          renderSheet();
+          startTick();
+
+          var xhr = new XMLHttpRequest();
+          voice.xhr = xhr;
+          xhr.open('POST', '/transcribe?token=' + encodeURIComponent(tok) + '&ext=' + voice.ext);
+          xhr.timeout = 180000;
+          xhr.upload.onprogress = function (e) {
+            if (!e.lengthComputable) return;
+            voice.sent = e.loaded;
+            voice.total = e.total;
+            renderSheet();
+          };
+          // Body fully sent — from here we're waiting on groq, not the network.
+          xhr.upload.onload = function () {
+            voice.sent = voice.total;
+            voice.state = 'transcribing';
+            voice.startedAt = Date.now();
+            renderSheet();
+          };
+          xhr.onload = function () {
+            voice.xhr = null;
+            stopTick();
+            var body = null;
+            try {
+              body = JSON.parse(xhr.responseText || '{}');
+            } catch (e) {}
+            if (xhr.status === 200 && body && typeof body.text === 'string') {
+              voice.state = 'ready';
+              renderSheet();
+              ta.value = body.text;
+              ta.focus();
+              try {
+                ta.setSelectionRange(ta.value.length, ta.value.length);
+              } catch (e) {}
+              return;
+            }
+            failVoice(
+              (body && body.error ? body.error : 'server returned ' + xhr.status) +
+                ' — the recording is still here, hit retry'
+            );
+          };
+          xhr.onerror = function () {
+            voice.xhr = null;
+            failVoice(
+              navigator.onLine === false
+                ? 'no connection — wait for reception, then retry'
+                : 'network error reaching the bridge — hit retry'
+            );
+          };
+          xhr.ontimeout = function () {
+            voice.xhr = null;
+            failVoice('timed out after 3 minutes — hit retry');
+          };
+          xhr.onabort = function () {
+            // Only ever from retry/discard, which set their own state.
+          };
+          xhr.send(voice.blob);
+        }
+
+        discard.addEventListener('click', function (e) {
+          e.preventDefault();
+          closeSheet();
+        });
+        primary.addEventListener('click', function (e) {
+          e.preventDefault();
+          if (voice.state === 'ready') {
+            if (!window.seanceMobile) return;
+            if (!window.seanceMobile.text(ta.value, true)) {
+              toast('no pane focused — tap a terminal first');
+              return;
+            }
+            closeSheet();
+            return;
+          }
+          uploadVoice(); // cancels any in-flight attempt and starts over
+        });
+
+        function pickMime() {
+          if (typeof MediaRecorder === 'undefined') return null;
+          var c = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
+          for (var i = 0; i < c.length; i++) {
+            try {
+              if (MediaRecorder.isTypeSupported(c[i])) return c[i];
+            } catch (e) {}
+          }
+          return '';
+        }
+        function extFor(m) {
+          if (!m) return 'webm';
+          if (m.indexOf('mp4') >= 0) return 'mp4';
+          if (m.indexOf('ogg') >= 0) return 'ogg';
+          return 'webm';
+        }
+
+        var rec = null,
+          chunks = [],
+          stream = null,
+          recStart = 0,
+          recTick = null;
+        var recTimer = mk('div', 'm-rec-timer', null, '0:00');
+        recTimer.hidden = true;
+        bar.appendChild(recTimer);
+
+        function stopTracks() {
+          if (stream) {
+            stream.getTracks().forEach(function (t) {
+              t.stop();
+            });
+            stream = null;
+          }
+        }
+        function paintRec(on) {
+          micBtn.classList.toggle('rec', on);
+          micBtn.textContent = on ? '■' : '●';
+          recTimer.hidden = !on;
+          body.classList.toggle('m-rec', on);
+        }
+        function startRec() {
+          if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            toast(
+              window.isSecureContext
+                ? 'no microphone api in this browser'
+                : 'mic needs https — use the seance.ham.xyz url'
+            );
+            return;
+          }
+          var mime = pickMime();
+          if (mime === null) {
+            toast('MediaRecorder unsupported');
+            return;
+          }
+          navigator.mediaDevices
+            .getUserMedia({ audio: true })
+            .then(function (s) {
+              stream = s;
+              chunks = [];
+              rec = mime ? new MediaRecorder(s, { mimeType: mime }) : new MediaRecorder(s);
+              rec.ondataavailable = function (e) {
+                if (e.data && e.data.size) chunks.push(e.data);
+              };
+              rec.onstop = function () {
+                stopTracks();
+                clearInterval(recTick);
+                recTick = null;
+                var type = (rec && rec.mimeType) || mime || 'audio/webm';
+                var blob = new Blob(chunks, { type: type });
+                chunks = [];
+                rec = null;
+                paintRec(false);
+                if (blob.size < 800) {
+                  toast('recording too short');
+                  return;
+                }
+                voice.blob = blob;
+                voice.ext = extFor(type);
+                voice.durMs = Date.now() - recStart;
+                uploadVoice();
+              };
+              rec.start();
+              recStart = Date.now();
+              recTimer.textContent = '0:00';
+              paintRec(true);
+              recTick = setInterval(function () {
+                recTimer.textContent = fmtClock(Date.now() - recStart);
+              }, 250);
+            })
+            .catch(function (err) {
+              stopTracks();
+              paintRec(false);
+              toast('mic denied: ' + (err && err.name ? err.name : err));
+            });
+        }
+        micBtn.addEventListener('click', function (e) {
+          e.preventDefault();
+          if (rec && rec.state === 'recording') rec.stop();
+          else startRec();
+        });
+
+        // ── touch gestures on the panes ───────────────────────────────────
+        // Axis is locked once, on the first ~10px of travel, and never
+        // revisited for that gesture — otherwise a drifting vertical drag
+        // starts flipping circles halfway through a scroll.
+        //   vertical   → scrollback for the pane under the finger
+        //   horizontal → previous / next circle
+        var tiles = document.getElementById('tiles');
+        var g = null;
+
+        function slugAt(target) {
+          if (!target || !target.closest) return null;
+          var hit = target.closest('[data-slug]');
+          return hit ? hit.getAttribute('data-slug') : null;
+        }
+
+        // Raised from the click that follows the tap, not from touchend: the
+        // synthesized mousedown in between moves focus to the pane, which
+        // blurs the catcher and drops the keyboard again.
+        var kbAfterClick = 0;
+        tiles.addEventListener('click', function () {
+          var t0 = kbAfterClick;
+          kbAfterClick = 0;
+          if (!t0 || Date.now() - t0 >= 600) return;
+          if (kbOpen()) catcher.focus();
+          else openKb();
+        });
+
+        tiles.addEventListener(
+          'touchstart',
+          function (e) {
+            if (e.touches.length !== 1) {
+              g = null;
+              return;
+            }
+            var t = e.touches[0];
+            g = {
+              x0: t.clientX,
+              y0: t.clientY,
+              lastY: t.clientY,
+              t0: Date.now(),
+              axis: null,
+              slug: slugAt(e.target),
+            };
+          },
+          { passive: true }
+        );
+
+        tiles.addEventListener(
+          'touchmove',
+          function (e) {
+            if (!g || e.touches.length !== 1) return;
+            var t = e.touches[0];
+            var dx = t.clientX - g.x0;
+            var dy = t.clientY - g.y0;
+            if (!g.axis) {
+              if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return;
+              g.axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
+            }
+            if (g.axis !== 'y') {
+              // Horizontal: swallow it so the page doesn't rubber-band while
+              // the circle change waits for touchend.
+              if (e.cancelable) e.preventDefault();
+              return;
+            }
+            var step = t.clientY - g.lastY;
+            g.lastY = t.clientY;
+            if (!g.slug || !window.seanceMobile || !window.seanceMobile.scroll) return;
+            // Browser scrolling must not move the page alongside terminal scrollback.
+            if (e.cancelable) e.preventDefault();
+            // Where the drag began: mouse-reporting TUIs (Grok) scroll the
+            // region under the pointer, not wherever it happens to be.
+            window.seanceMobile.scroll(g.slug, step, g.x0, g.y0);
+          },
+          { passive: false }
+        );
+
+        tiles.addEventListener(
+          'touchend',
+          function (e) {
+            if (!g) return;
+            var gesture = g;
+            g = null;
+            if (!mobile() || !window.seanceMobile) return;
+            var t = e.changedTouches && e.changedTouches[0];
+            if (!t) return;
+            // A tap never locked an axis (it never travelled 10px). Ask the
+            // wasm what is under the finger; a URL raises the link sheet and
+            // anything else raises the keyboard (on the click, see above).
+            if (gesture.axis === null) {
+              if (!gesture.slug || !window.seanceMobile.urlAt) return;
+              if (Date.now() - gesture.t0 > 700) return;
+              var hit = window.seanceMobile.urlAt(gesture.slug, t.clientX, t.clientY);
+              if (hit) openLinkSheet(hit);
+              // Tile buttons stop their click, so it never reaches #tiles.
+              else if (!(e.target.closest && e.target.closest('button'))) kbAfterClick = Date.now();
+              return;
+            }
+            if (gesture.axis !== 'x') return;
+            var dx = t.clientX - gesture.x0;
+            if (Date.now() - gesture.t0 > 800) return;
+            if (Math.abs(dx) < 60) return;
+            window.seanceMobile.cycle(dx < 0 ? 1 : -1); // left = forward
+          },
+          { passive: true }
+        );
+        tiles.addEventListener('touchcancel', function () {
+          g = null;
+        }, { passive: true });
+
+        document.addEventListener('keydown', function (e) {
+          if (e.key !== 'Escape') return;
+          if (document.activeElement === catcher) return;
+          if (!linkSheet.hidden) closeLinkSheet();
+          if (!sheet.hidden) closeSheet();
+          setNav(false);
+        });
+      })();
+    </script>
+  </body>
+</html>

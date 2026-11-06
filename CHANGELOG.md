@@ -1,0 +1,2463 @@
+# Changelog
+
+All notable changes to seance are documented here.
+
+Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)-ish.
+Versioning: `0.9.x` while the product is still finding its shape — bump
+**patch** for daily-driver / orchestration shippable batches, **minor** only
+for deliberate breaks. Date is UTC commit day of the version tag/commit.
+
+When shipping a versioned commit (`seance 0.9.N — …`):
+
+1. Bump `Cargo.toml` / `Cargo.lock` / README status line
+2. **Add a section at the top of this file** (same commit)
+3. Update any version-pinned contracts in `CLAUDE.md` if behavior changed
+
+Unreleased work can sit under `## [Unreleased]` until the version bump.
+
+## [Unreleased]
+
+### Added
+
+- **`seance-desktop-notifications = false`** in `terminal.conf` turns off every
+  desktop banner (needs-human, ask, pane alerts, finished Claudes). Sounds and
+  clearing stale banners are untouched. Read at launch.
+- **Read ticks in the Chat layout**, as on the phone. Next to each bubble's
+  time, your notes show a readable ✓ while they wait for the lead, ✓✓ in the accent
+  color once the lead has seen them and when answered (a failed one says "not delivered" in red); a
+  lead's message gets ✓✓ in the accent once you have read it on any device.
+  Hover for what a tick means. A refresh now re-reads the newest 20 messages,
+  so a note moving from sending to got to answered repaints; opening a circle
+  reads its whole thread.
+- **The AFK button in the Chat layout.** The same AFK chip Stage and Wall show
+  now sits beside the ✦ seance mark at the top of Chat's circle list: same
+  state, same confirm, same switch (and absent where the afk script is not
+  installed).
+- **The theme chooser in the Chat layout.** The ✦ seance mark now sits at the
+  top of Chat's circle list, above the layout switch, and opens the same menu as
+  in Classic and Stage (connected guis, and the dark and light themes with the
+  active one marked). A pick switches live in every window, and Chat, which draws
+  only from the active theme's colors, repaints with it.
+- **Tap-to-answer choices in the Chat layout.** When a lead's message offers
+  choices (its `choice:` lines), they show as pill buttons in a wrapping row
+  under the message, the first tinted as the lead's pick. Tapping one sends it
+  as your message, tied to the message it answers; the tapped pill fills, the
+  others dim and everything goes dead. A message that was already answered
+  (here or on the phone) shows its picked pill filled. A failed send brings the
+  pills back with the reason on top.
+- **Parked tasks can be sent back or closed from the tasks card.** Each
+  Parked row (in Classic and in the Chat header's card) gets a round ↩
+  button ("do this next": the lead gets the task again as your message and
+  the parked copy closes) and a small × ("close it"), like the phone's list.
+  The buttons are dead while the call runs, the card refreshes after, and a
+  refusal from Invoke shows under the row. They only appear on rows from
+  Invoke's list, not on the daemon's fallback.
+- **Chat bubbles: select, copy, links, paths and photos.** Text in a bubble
+  can be selected and copied, links open on click, double-clicking a file
+  path that exists on this Mac opens it the way a terminal does (images,
+  videos and pages in their app, anything else shown in Finder), and
+  clicking a photo opens the cached file in its app. Bubbles are drawn with
+  the same selectable text view as file panes; the bubble look is unchanged
+  apart from links, which take the theme's link color.
+- **Claude usage in the Chat layout.** A thin centered line under the
+  thread header shows the plan usage the phone shows ("5h 18% · ⟳ 12:50 PM
+  7d 35% · ⟳ Thu 2 AM"): numbers turn red from 80%, and the line hides
+  when Invoke reports no usage.
+- **Active section in the Chat layout.** The circle list starts with an
+  "Active" heading: circles (not alerts) with unread messages or a last
+  message under two hours old, newest first, the same rule as Invoke's
+  phone list. An active circle moves up out of its space until it cools off.
+- **Chat layout.** A third layout, next to classic and stage, takes
+  Wall's place in the switch (ctrl+shift+t cycles classic, stage, chat; a
+  saved or `ctl layout wall` still works and opens Chat; Wall's code and
+  its ctrl+shift+space peek stay). Circles are listed on the left as
+  Invoke-style rows in the sidebar's space order: creature, name, last
+  message, unread count and a pulse while the circle works. The selected
+  circle's thread is on the right as bubbles (you on the right, the lead
+  on the left, system notes centered), with photos inline, clickable links
+  and a composer (Enter sends, Shift+Enter adds a line). The history is
+  Invoke's own, read from its API, so the phone and this window share one
+  conversation, and reading a thread marks it read on both. The header
+  shows the creature (dancing while the circle works), the lead's progress
+  line, the lead's to-do chip and a "show terminal" button that goes back
+  to Classic on that lead. Set `SEANCE_INVOKE_URL` to point at a different
+  Invoke. Not yet: builder guest bubbles, per-bubble terminal peek, photo
+  upload.
+- **A lead's to-do list on its pane.** The lead's title strip gets a
+  "☑ N" chip (open and queued tasks; parked ones are not counted). Click it
+  to open a floating card under the chip (about 420 px wide, up to 60% of
+  the window tall, with its own scroll) while the terminal stays visible and
+  live: the open task with its live activity line and start time, helpers
+  working, up next, parked, and the last six finished tasks with how long
+  each took (times older than today carry their date). Click a row for its
+  full text. The card closes when you click the chip again, click outside
+  it, or press Esc, and also when its pane is killed, stops being the lead
+  or the layout changes. Focus never moves when it opens or closes. While
+  it is open, a backdrop catches clicks, so the terminals underneath do not
+  scroll. In the Chat layout the header's chip opens the same card. Phone
+  tasks show without their Invoke header and footer. The app asks the
+  daemon with one new fs-bridge request, `lead_tasks`; task text is capped
+  daemon-side, and an older daemon without it no longer causes a sticky
+  error bar or a slow poll.
+- **Working creatures throw in random dance moves.** Every few bars a
+  lead's creature swaps its basic step for a jump, shimmy, slide or bounce,
+  and each circle dances on its own beat instead of in step.
+
+- **The lead's creature dances while its circle works.** On the lead's
+  title strip and Stage card, the sprite hops left and right whenever any
+  pane in the circle is mid-turn, and rests when the circle goes quiet.
+
+- **Double-click a file path to show it in Finder.** A path an agent
+  printed (`/…` or `~/…`, spaces, accents and wrapped rows included) opens
+  its folder with the item selected, files and folders alike, and copies
+  the path. Images, videos, PDFs and HTML pages open in their app instead. A command span that holds a
+  path still copies whole. A `/home/<you>/…` path from a daemon-host pane is found
+  under the Mac's home folder. Linux opens the parent folder.
+- **Claude's replies in their own colour.** In a Claude Code pane, the
+  reply text (from Claude's `●` down to the next tool call or prompt) is
+  painted in the theme's accent, eased to read at 7:1, so it stands apart
+  from command output, which Claude draws in the same plain colour. Code,
+  links and other coloured text keep their colours.
+
+- **Claude plan usage in the footer.** Stage's footer (and the Wall's
+  feed) shows a bar per Claude limit, 5 hour and weekly, with percent used
+  and time to reset, read from `seance-usage-file` every 15 s. The health
+  report's facts move to the right, next to its time.
+
+- **Themes grouped dark and light.** The ✦ menu lists the dark themes,
+  then the light ones, each under its own heading.
+
+- **Clicks reach Claude Code and other mouse apps.** A plain click in a
+  pane whose app turned on mouse reporting is now sent to the app, so
+  Claude Code's own buttons (the X on its diff panel) work. Drag-select,
+  double-click copy and cmd+click links stay in Seance; shift+click keeps
+  a click in Seance too. The first click of a double-click also reaches
+  the app.
+
+- **Snooze 1h on Stage.** Needs-you and done chips, and the peek card, get
+  a **Snooze 1h** button: that pane's chip, banners and dings
+  go quiet for an hour (ctrl+shift+i skips it too), then the chip comes
+  back if it's still waiting. Opening the pane ends it early. "N snoozed"
+  at the end of the bar brings them all back. Kept across restarts in
+  `~/.config/seance/view.json`.
+
+- **Layouts.** A classic · stage · wall toggle sits under the logo in the
+  rail (and in the top bar of the other two); ctrl+shift+t cycles them.
+  Classic is today's layout, unchanged. Wall replaces the live overview
+  (ctrl+shift+space still toggles it, and leaving it returns to the layout
+  you came from). Each window
+  keeps its own layout and the GUI machine remembers the last pick in
+  `~/.config/seance/view.json` (a ctrl+shift+space peek is not saved). `seance ctl layout` lists the layouts and
+  each window's current one; `seance ctl layout NAME` switches every
+  attached window.
+
+- **Stage layout.** One circle's lead up front, live and typeable (esc
+  reaches it; esc no longer leaves Stage). A strip of circle pills with
+  their state replaces the rail, with "+N more" when they don't fit and a
+  jump box for the jump palette. A needs-you bar lists every waiting pane in
+  every circle with an Open button. The lead's header shows its machine,
+  state and a Doing / Next / Waiting on line from the circle's LEAD-LOG.md.
+  The crew sits beside it as cards with each pane's last output line (click
+  to put one on stage), the circle's files as tabs below, and a health
+  footer at the bottom. The dock panel hides on Stage. New `terminal.conf`
+  keys `seance-circle-map` and `seance-health-file` point at the daemon-side
+  files; both are optional. The daemon now sends each circle's lead in
+  State and pushes a fresh State when `ctl lead --set` changes it. See
+  README, "Stage".
+
+- **Wall layout.** A tile per circle of the current space, in rail order,
+  with the selected circle big (its lead live) and a Today feed on the
+  right, replacing the old overview. Tiles show each circle's state (needs
+  you with an Open button, done, working, lead exited, waiting on a sleeping
+  Mac, idle), the lead's current task (its terminal title), the LEAD-LOG's
+  Doing line, the lead's last finish result and the LEAD-LOG's Next or
+  Waiting on; the lead's last screen line shows only when a circle has none
+  of the first three. Sleeping circles fold into a "+N asleep" tile. Arrows move the
+  selection, Enter or a double click opens Stage on it (Focus), and typing
+  no longer reaches a hidden pane while the Wall is up. The feed reads the
+  day's needs-you, done, exit, lead and sleep events from a new fs bridge op
+  (`fs_op: "events"`), plus the health report. See README, "Wall".
+
+- **Space tabs on Stage and the Wall.** When two or more spaces have
+  circles, a row of tabs across the top, led by the seance mark, lists them
+  with the same needs-you, working or done mark as their rail rows. Click a
+  tab to show that space; right-click to rename it, make it the default or
+  delete it. ctrl+alt+pageup / pagedown (cmd+option+↑↓ on macOS) steps
+  through spaces in any layout.
+
+- **Mark unread.** Right-click a pane's rail row or Stage crew card, or use
+  the **mark unread** button in Stage's lead header, to flag a pane to come
+  back to. It gets a dot on its row and an **Unread** chip in Stage's
+  needs-you bar until you next open it; **mark read** clears it by hand.
+
+- **Done marks you can trust.** A Claude pane that finishes while you're
+  looking elsewhere gets its done mark however short the turn (the banner
+  and the lead's done sound still wait for 5 s or more). Stage's needs-you
+  bar shows a ✓ chip for each finished pane in the circle you're on too, and
+  the lead's card gets a **Crew** line naming the newest crew pane that
+  finished, when, and the first line of its reply, until you open it. The
+  peek card on a ✓ chip says when the report was filed (and the day, when
+  it wasn't today) and shows the pane's **Last reply** when it adds to the
+  report.
+
+- **Auto-sleep, one pane at a time.** Idle Claude panes are now slept one
+  by one rather than whole circles, including Claude started from a shell
+  or a wrapper, and wake into the same conversation. A shell in the circle
+  no longer keeps its Claude panes awake. `seance-auto-sleep-idle` in
+  `terminal.conf` sets how long a pane sits idle first (default `12h`, `off`
+  to stop it) and `seance-auto-sleep-skip` lists circles to leave alone.
+  Typing into a sleeping pane or sending it work (`ctl send`, a queued task,
+  a message) wakes it.
+
+- **Docked file panes.** A file pane's title strip has a dock button that
+  moves it into a panel on the right of its circle, one tab per file. New
+  file panes open there by default, so terminals keep the grid; the button
+  puts one back. Every window shares the arrangement.
+
+- **Lead sprites.** A circle's lead pane shows a small pixel creature in
+  its title strip and beside **LEAD** on Stage, generated from the circle
+  slug. `seance-lead-sprite.<circle-slug> = SEED` in `terminal.conf`
+  re-rolls one.
+
+- **Restart Seance (macOS).** The app menu has **Restart Seance**, which
+  quits and reopens the app. Panes live on the daemon, so it is the same as
+  quitting and reopening by hand.
+
+- **Color schemes.** Twelve looks for the whole app, chrome and terminal
+  colors together: candlelit (the default, unchanged), abyssal, ectoplasm,
+  ouija (light), Monokai Seance, tarot, Mojave Dusk, riso (light), Synth
+  Seance, and three in between: Fog (a lifted slate dark), Parlor and
+  Herbarium (dimmed light grounds). Pick one from the ✦ menu at the top of the rail or with
+  `seance ctl theme ID` (`seance ctl theme` lists them). The daemon saves the
+  choice and every attached window, thin clients included, repaints at once;
+  each pane is re-sent in the new colors, idle ones too. Colors a program set
+  for itself survive the switch. Candlelit keeps `terminal.conf`'s terminal
+  palette; `seance-theme = ID` there sets the startup scheme until one is
+  picked. The web client stays candlelit for now.
+
+- **Needs-you dot kept (this fork).** 0.27.0 dropped the rail's `needs`
+  state; here a circle, its space and the pane row still blink while one of
+  its panes is live needs-human, blocked or risky. Nothing sticky comes
+  back: it clears as soon as the pane's status does.
+- **Tick task boxes in a markdown file pane.** Clicking a `- [ ]` / `- [x]`
+  box flips that one line in the file on disk; nothing else in the pane is
+  editable. The click writes only if the file still matches what the pane
+  shows (otherwise a toast, nothing written), through a new daemon op
+  (`FsOp::WriteIfUnchanged`: re-checks, writes atomically through symlinks,
+  keeps permissions), so it works from any GUI once the daemon runs this
+  version. The change lands in history like any other edit. See
+  docs/FILE-PANES.md, "Task boxes".
+- `~/.config/seance/terminal.conf` (Ghostty config syntax, `config-file`
+  includes and `theme` names work) sets the terminal palette, font, bell
+  sound and command-finish notifications. No file keeps today's look.
+- Terminal alerts: BEL plays the bell sound, and OSC 9 / OSC 777 and long
+  shell commands post a desktop notification when you aren't looking at that
+  pane (new `pane_alert` event). OSC 52 copies reach the clipboard of the
+  window showing the pane (`pane_clipboard`).
+- macOS line editing like Ghostty: cmd+backspace, cmd+left/right,
+  option+left/right; cmd+click opens links. Alt+backspace deletes a word on
+  every platform.
+- `seance ctl rename-pane [PANE] NAME` sets a pane's display name from a
+  script (the slug never moves).
+- Lifetime UUIDv4 identities for panes and circles: `SEANCE_PANE_ID` and
+  `SEANCE_WORKSPACE_ID` in launched processes, `pane_id` and `workspace_id`
+  in ctl pane rows and `whoami`, and `id:<pane_id>` pane addressing. IDs
+  survive renames, sleep/wake, cold restore and daemon upgrades; deleted
+  panes/circles and handoff successors never reuse them. Legacy state and
+  upgrade bundles gain IDs and save them immediately. Processes retained
+  by a live upgrade receive the env vars on their next wake/restore.
+
+- **+ circle on Stage.** The strip ends with a "+ circle" chip that makes a
+  circle in the space on show and opens its name. Enter names it and opens
+  its first pane: a plain shell, or what the new `terminal.conf` key
+  `seance-new-circle-command` names. Esc leaves the circle empty.
+
+### Changed
+
+- **A folded markdown heading counts list items, not lines.** The badge next to a
+  collapsed heading now reads "3 open" (unchecked task boxes, when the section
+  has any), "4 items" or "1 item" for the top-level list items it hides,
+  nested ones with their parent and code fences ignored; no list, no badge.
+- **Circles with `claude-mac` leads can sleep now.** A pane running
+  `claude-mac` with its conversation id in the command (`CLAUDE_MAC_ARGS`
+  holding `--resume <id>`, `-r <id>` or `--session-id <id>`) counts as
+  restorable: the transcript is on the Mac, so the daemon does not look for it,
+  and waking runs the pane's own command again, which resumes that
+  conversation. Without a pinned id, and for plain shell panes, nothing
+  changes: they still keep their circle awake. This is a daemon change: the
+  daemon needs the new build.
+- **The tasks card reads Invoke's list.** The card behind a lead's "☑ N"
+  chip (in Classic and in the Chat header) now shows what the phone shows:
+  the lead's own name for each task as the row title, with the user's own words
+  in faint text under it ("You: ..." from the phone, "Asked: ..." from a
+  pane), plus an "In progress" section, right under Now, for busy helper
+  panes (name, task and progress line) and the lead's background agents (what
+  each is doing and how long it has run). The daemon's own list is used only
+  while Invoke cannot be reached.
+- **A send no longer cancels a task.** `seance ctl send` to a busy pane is
+  queued behind its turn (`queued behind task-N (K ahead)`) and delivered
+  when it goes idle, oldest first, instead of being refused with exit 4. A
+  send to an idle pane goes in now, and the task it replaces is **parked**
+  (its turn was over: waiting on you, blocked, or never finished), not
+  cancelled: `ctl list` shows `parked=` ids, `ctl finish --task ID` still
+  finishes one, and parked tasks prune after 7 days like finished ones.
+  `send --now` cancels the open task on every path, `--queue` and a
+  sleeping pane included, and a queued one goes to the front. `ctl list` also shows `queued=` ids. Queued tasks
+  no longer keep a pane from auto-sleeping. Killing a pane orphans its open
+  task and cancels its queue, so a pane that reuses the slug starts clean;
+  `ctl handoff` hands the queue to the successor. Tasks of panes that
+  don't come back on load are orphaned the same way. `ctl wait --task T
+  --status done` on a task the pane has moved past judges T itself, not the
+  pane's badge. A queued task now needs 1.5s of unbroken idle, and a paste
+  stuck in the composer fails at the end of its window instead of holding
+  the queue.
+
+### Fixed
+
+- **Chat: videos, line breaks and the tasks card.** A video a lead sends as
+  a note is a "▶ video" tile, not a picture: nothing is downloaded until you
+  click it, then it downloads with up to 15 minutes to spare ("downloading…"
+  shows meanwhile, a failure says so and waits for another click) and opens in
+  its app. Every line break in a message now shows (a single newline used to
+  vanish: "png" and "image" ran together). On the tasks card, a poll that was
+  asked before a resume or close no longer brings the row back for a moment,
+  and a row's error goes away when the row does.
+- **Chat pictures fit their bubble.** A photo or screenshot in a bubble is
+  held to 320 px wide and about 420 px tall at its own shape, in a box whose
+  size is reserved from the picture's header (a plain box until the file has
+  arrived), so a tall phone photo no longer runs past the bubble, under the
+  next messages or behind a reply's text. A note with several pictures shows
+  all of them, stacked above its text. Pictures always come through Invoke's
+  `/api/file`; clicking one still opens it full size.
+- **A busy pane's progress line no longer flickers to its window title.**
+  Claude's spinner drops off screen for a frame now and then, and the
+  roster's `activity_evidence` fell back to the OSC title until it came
+  back. The last spinner line now holds for up to 10 seconds.
+
+- A pane that slept and woke quickly could be closed by the old session's
+  late exit, cancelling its queued tasks. Only the session a pane holds can
+  close it now.
+- A crew pane starting work no longer wipes its circle's done mark.
+- After a daylight saving change, the Wall's Today feed, the health row and
+  event times followed the old UTC offset until the daemon restarted.
+- One failed read over a flaky tunnel blanked Wall tiles and Stage's lead
+  card and health footer; they now keep what they showed until a read
+  succeeds (a file that is really gone still clears).
+- `daemon-upgrade.log` filled with NULs after an upgrade; it is appended to
+  now, like `daemon.log`. While the daemon's socket can't be reached at all
+  the GUI retries less often (up to every 5 s) and logs about once a minute
+  instead of every 400 ms.
+- Repeated status-sets no longer write the event log, save state and
+  broadcast when nothing changed, and finished tasks leave saved state a
+  week after they finish.
+- Claude Code compacting an idle session (about 55 minutes after its last
+  turn) no longer counts as a finished turn: no ✓, done banner or ding.
+- macOS banners (with terminal-notifier) are one per pane: a pane's new
+  banner replaces its old one, and opening the pane, or Seen on its Stage
+  peek card, takes it out of Notification Center.
+
+### Removed
+
+- PR links, gone everywhere: the PTY scraper, the per-circle link list and
+  its dismissals, the `pr_watch.json` watcher, `ctl pr-link`, the header PR
+  chips and the `PRs (N)` board in both GUIs (and the phone circle menu).
+  Saved state and upgrade bundles that still carry `pr_links` /
+  `pr_dismissed` load fine, and those fields are dropped.
+- Prefix auto-spaces. A label like `mtg-ai` no longer routes a circle or
+  mints a space, and rows no longer dim a prefix their space names. Circles
+  move only by hand; a new one lands in the space on screen. Existing auto
+  spaces load as ordinary spaces and keep their circles (`prefix` / `auto` /
+  `placed` are ignored and drop on the next save). `seance-core`'s unused
+  `grouping.rs` went with it.
+
+## [0.27.0] — 2026-10-11
+
+### Added
+
+- **Spaces: the rail's top tier.** The rail lists spaces first, one line
+  each with a spinner or dot for anything happening inside and a count. Below
+  them it lists the circles of the space on screen. Click a space to show it.
+  Drag a circle's row onto a space to move it. The web and phone clients do
+  the same from the row menu and the circle sheet ("move to space"). Spaces
+  live in the shared rail arrangement (`subscriptions.json` → `spaces`), so
+  every window agrees. The model is `seance-core/src/spaces.rs`:
+  - One space is the **default** (`general` at first). It can be renamed,
+    never deleted, and it catches anything without a better home. Deleting a
+    space sends its circles there.
+  - A label prefix still routes circles: a space whose prefix matches catches
+    them, and a prefix that ≥2 circles share mints an **auto** space. Generated
+    names like `claude-49` never count. A circle you move by hand stays put;
+    a prefix never moves it again. An auto space disappears when it empties.
+    Renaming one keeps it and keeps its prefix as an alias (rename `mtg` to
+    "meetings" and `mtg-*` circles still land there).
+  - New circles land in the space on screen.
+  - Clicking a space selects its first circle.
+  - Drag a space onto another to reorder (drop on the divider under the
+    spaces to send it to the end).
+    Spaces never auto-sort; only circles do, inside a space. The web uses
+    move up/down instead.
+  - Right-click a space → **banish all** kills every circle in it, after a
+    confirm (a red pill on the row on desktop, a dialog on web).
+  - Upgrading guesses nothing. Existing ≥2-prefix clusters become auto spaces,
+    and everything else goes to `general`.
+- **Filter chips** over the rail: all · pins · one per host circle mode
+  (AFK, slack). A filter narrows the list across every space and never moves
+  a circle. A chip with nothing in it doesn't show, and the bar disappears
+  when "all" would be the only chip. Right-click **pins** to unpin
+  everything. **Right-click a mode chip** to turn the mode off for every
+  circle in it, e.g. "i'm back" to all AFK circles at once.
+- `ctl space [list]`, `ctl space new|rename|rm|default`, and `ctl move
+  [CIRCLE] SPACE` edit the same arrangement and push it to every window.
+- Host circle modes can be **off-only**: set just `off_label` + `off_prompt`
+  on a host-owned mode to offer the way out without offering the way in
+  (docs/HOST.md).
+
+### Changed
+
+- **Pins don't move circles anymore.** The pinned band is gone. Pinning
+  (ctrl+shift+p, the row menu, the phone sheet) puts a circle under the
+  pins chip and leaves it where it is.
+- Prefix clusters and their folds are gone; spaces replaced them.
+- **The rail's `needs` state is gone**: no needs badge for a circle you
+  never selected, for a `needs-human`/`blocked` status, or for a PR waiting
+  on you. It lit up for too many reasons to mean anything. PR chips and the
+  PR board still color a PR that needs you, and `ctl status-set needs-human`
+  still notifies.
+- The selected circle and space get an amber fill, and hovering deepens it
+  instead of replacing it.
+- Host modes no longer get bands above the rail, so `top` is ignored. Their
+  circles show under their chip.
+- The header's `◈+` is now **`+ space` `+ circle`**.
+- Quicklaunch and host-menu circles no longer arrive pinned. They land in the
+  space on screen. A host menu result can still say `"pin": true`.
+- ctrl+page, ctrl+shift+1…9 and ctrl+shift+home walk the rail's list: the
+  space on screen, or the active filter.
+
+### Added (earlier, unreleased until now)
+
+- **codex and grok panes come back on their own conversation** after a daemon
+  crash, an OOM, or a sleep/wake, the way claude panes already did. grok gets
+  a minted `--session-id` and restores with `--resume`. codex can't be handed
+  an id, so the daemon reads it off the rollout file the pane's codex holds
+  open (checked every 10s) and restores with `codex … resume <id>`. A codex
+  `/new` moves the pane to the new thread. codex and grok circles can now sleep.
+  State field `claude_session` is now `agent_session`, and old state files
+  still load.
+- **Circle modes** (host.json `circle_modes[]`, docs/HOST.md): right-click a
+  circle (or use the phone circle sheet) to turn on a host-defined mode such as
+  AFK. The circle's first pane gets the mode's prompt, and the rail badges the
+  row, tints it violet and, for `top` modes, lifts it above the pins. Turning
+  it off sends the off prompt. With no host config, none of this appears.
+  A mode can name a `state_cmd`. The daemon then polls it, and the host
+  decides who is in the mode (for AFK, vita's `onthego list`), so circles that
+  went AFK from the phone or timed out show correctly.
+  Each top mode gets its own band above the pins. A mode with no toggle
+  fields is display-only, e.g. vita's `slack` mode, which lists the circles
+  whose pane holds a cadence slack thread.
+- Phone web views show one pane at a time, with tabs across the top to switch
+  panes. The active terminal fills the screen above the keyboard.
+- `--help` / `-h` anywhere on the `seance` command line prints top-level
+  usage and exits. `seance upgrade --help` no longer upgrades the daemon, and
+  `restart-gui --help` no longer restarts the GUI.
+- **Orchestrator ergonomics** (docs/ORCHESTRATOR-ERGONOMICS.md):
+  - `roster` / `brief` / `status` report each pane's `activity` (`busy`,
+    `idle`, `awaiting-input`, `limited`, `exited`, `unknown`), read by the
+    daemon from the live screen and title. They also carry `quota` (Claude
+    statusline 5h/7d used %, Codex weekly % left) whenever the agent's TUI
+    shows those numbers.
+  - `ctl send` confirms the paste landed (the agent went busy, the text
+    echoed, or Enter is re-pressed when the paste sits unsent). If nothing
+    lands it re-pastes once (`--retry N`), then exits 3 naming the open task.
+    It refuses to paste into a modal. `--no-confirm` skips all of this.
+  - `ctl note-agent PANE TEXT` delivers a note into the running task, with no
+    new task and no cancel.
+  - `ctl handoff PANE --agent claude [--note T]` moves the open task to a fresh
+    agent in the same cwd and circle, then kills the original.
+  - `ctl new --json` works with `--wait-ready`. `--task-file` sends a first
+    task. The reply is one JSON line: `{slug, name, requested_name,
+    workspace, cwd, command, parent, ready, task_id, delivery}`.
+  - `status` returns the full roster row (adds `cwd`, `activity`, `task_id`,
+    `parent`).
+  - Panes spawned from inside a pane record their `parent`. Filter with
+    `roster --parent SLUG` or `roster --top`.
+  - `wait --artifact PATH --either --fresh` returns when a result file lands
+    *or* the task is finished. `wait` now fails fast when the pane is gone or
+    exited, or when `--task` was superseded, instead of timing out.
+- **Sessions talk to each other by name** (docs/COMMS.md). `ctl ask --to
+  CIRCLE` asks another session and prints its answer. `tell` sends a one-way
+  note, and `reply m-N` answers a question, routed back by id so nobody
+  types a return address. Circles are addressed by label, slug or a former
+  label, and a circle is answered by its lead (first pane, or `ctl lead
+  --set`). Messages are not tasks: they never open or cancel one, and a busy
+  agent gets them behind its turn. Panes that talk to a circle are notified
+  when it is renamed or its lead closes. A question left unanswered by a
+  closing lead is re-asked of the new lead. A bare name that is both a pane
+  and another circle is refused on every pane verb; use `@name` or `pane:name`.
+- `ctl skill` gains "Talking to another circle": circle labels vs slugs, the
+  lead pane, `note-agent` for questions, and replying to your pane
+  (`$SEANCE_SESSION`), never your circle slug (a misrouted reply on 09-29
+  came from exactly that). The ⚡ arm prompt is now a pointer to `ctl skill`;
+  docs/CONTROL.md shows how to load the skill at session start instead.
+- **Send queue** (`ctl send --queue`): a busy pane gets the task as `queued`,
+  and the daemon delivers it once the pane is idle, with the same delivery
+  confirmation. Without `--queue`, `send` to a busy pane is refused up front
+  (exit 4, nothing opened). A send whose delivery can't be confirmed is rolled
+  back: the new `task_fail` op marks it `failed` and reopens the task it had
+  cancelled.
+- `wait --artifact-match REGEX` / `--artifact-contains TEXT`: wait for a
+  progressively written result file to match (e.g. its closing ```json block).
+  `wait --task` keeps waiting on a queued task.
+- Rows gain `context_left_pct` (Claude "…until auto-compact", Codex "context
+  left"), `queued_input` (Claude "Press up to edit queued messages") and
+  `queued_tasks`. `ctl skill` documents every roster/status JSON field.
+- `note-agent` reports `via: "queued"` when Claude parks the note behind a
+  running turn, and no longer re-pastes it (that stacked five copies on one
+  pane). `--interrupt` delivers it now via Claude's "send now", which
+  interrupts the turn.
+- Drag the desktop sidebar's right edge to resize it; its width persists.
+- Right-click a prefix group → **rename group** to replace the prefix on all
+  matching workspace labels, across pinned and unpinned sections. Suffixes,
+  workspace identities, and running sessions stay intact.
+
+### Fixed
+
+- **Pane processes now die with their pane.** PTY masters were opened without
+  close-on-exec, so every pane inherited the masters of all panes spawned
+  before it and no pane's tty ever hung up. A daemon crash, a kill or a sleep
+  left the agent running as an orphan, holding its RAM (about 8GB of them had
+  built up). Masters are now CLOEXEC (and handed-off ones on receipt), kill and
+  sleep hang up the pane's whole process group (codex is a node shim over a
+  native binary), and a daemon closes any `/dev/ptmx` it inherits at startup.
+  Panes spawned before this fix keep their leaked fds until they restart.
+- **grok panes read idle / busy, so `send` and `new --wait-ready` work.** The
+  classifier didn't see grok's boxed composer (`│ ❯ … │`) and took the
+  `❯` echo of a past prompt in the transcript for an unsent paste, so `send`
+  reported failure and re-pasted (duplicate prompts), `--wait-ready` hung, and
+  a busy grok wasn't refused. Its `Ctrl+c:cancel` footer now marks a running turn.
+- Web: scrolling with a finger works in Grok (and any TUI that scrolls the
+  region under the pointer). The touch scroll now reports where the drag
+  began instead of the top-left corner, which was Grok's header.
+- Web: touching or typing in the phone view takes the pane's size over from
+  the desktop (at most every 2s), so a circle sized for the desktop becomes
+  phone-sized as soon as you use it there. Focus, tab switch and rotation
+  already did.
+- Two windows showing the same circle no longer bounce a pane's size back and
+  forth at frame rate. A window now only re-asserts a size it asked for itself,
+  never one it saw in another client's frame.
+- Web: a browser restart lands back on the circle it had selected, instead of
+  whichever circle the desktop last looked at. On phones, tapping a quicklaunch
+  chip closes the nav drawer.
+- Web: tapping a wrapped link opens the whole URL, including links that Claude
+  wraps itself (short of the edge, with an indent).
+  A list of links one per line no longer glues the next item's bullet onto
+  the URL (`…?item=289-`).
+- A folder-trust dialog can no longer be answered by accident. Claude's
+  dialog opens on **"No, exit"**, so the first `send`'s Enter quit Claude.
+  `new --wait-ready` now stops at once and names a trust dialog.
+  `new … --trust` (and `handoff --trust`) accepts it by moving the cursor to
+  "Yes" one checked step at a time; a blind keystroke is never sent. Codex
+  update menus are skipped. `send` refuses to paste into any modal.
+- Codex panes use `--no-daemon` when supported; `ctl` rejects shared-server
+  or mismatched pane identity instead of finishing another pane's task.
+  `finish --task` rejects foreign, unknown, or superseded tasks before writing.
+- Mousewheel scrolling over the Codex transcript now sends the pointer's
+  position, so wheel events reach the transcript instead of the prompt.
+
+### Removed
+
+- Telegram phone buttons from desktop pane headers and the pad drawer.
+  `seance ctl phone` remains available.
+
+## [0.26.2] — 2026-09-13
+
+### Added
+
+- **The mac CLI follows the app's saved host**, including while the GUI is
+  closed. Local prompt files and stdin travel with the request; `ctl --local`
+  bypasses remote routing. The mac installer links the bundled CLI and can
+  install the `seance-control` skill for ChatGPT/Codex and Claude.
+
+- **The phone can rename a circle.** The desktop offers two spellings —
+  double-click a rail row, or its right-click menu — and a finger reaches
+  neither, so a circle created from the phone kept whatever the launcher
+  called it. The circle menu (tap the topbar title, where the PR list already
+  lives) now carries a `name` field above the PRs. It commits the same
+  `RenameWorkspace` request the rail does, so it moves the LABEL and not the
+  slug: panes, PR links, `$SEANCE_WORKSPACE` and the rail's pins all stay put.
+
+- **The phone can pin and unpin a circle, and a pin now lasts.** Same circle
+  menu as rename, under `rail`. The desktop's spelling is a right-click on a
+  rail row, which a finger doesn't have — so circles launched from the phone
+  (launch buttons open their circle pinned) could never be put back once they
+  slipped.
+
+- **A jump-to-the-bottom button on the phone.** Fourth in the floating
+  cluster, right of the record button, and only there while a pane on screen
+  is actually scrolled back — at the tail it is gone entirely. The daemon owns
+  the scroll position and never puts it on the wire, so the client counts the
+  rows it asked for and drops the count on anything that returns the pane to
+  the tail (every keystroke does, daemon-side). That can leave the button up
+  when something else scrolled you down — one tap clears it — but it cannot
+  leave you in history with no way out, which is the direction that matters.
+
+- **Banish a circle from the phone.** Bottom of the circle menu, under
+  `danger`: first tap arms, second banishes, same two-step as the rail row's
+  `×`. That × is on the phone too, but it is a hover-sized target inside a row
+  whose tap selects the circle — not something to aim a thumb at when it kills
+  every pane in the circle.
+
+- **Tap a URL in a pane to open it.** Native ctrl+click has opened the link
+  under the cursor for a while; the browser client had no spelling of it at
+  all, on a phone or on a desktop. Both now do: ctrl+click on the desktop,
+  and on a phone a tap raises `#m-link`, a bottom sheet showing the URL with
+  `copy` and `open`. Deliberately a sheet rather than a jump — tapping a
+  terminal is also how you focus a pane, and a mis-hit that threw you out to
+  Safari mid-session would be worse than no feature.
+
+  The detector moved to `seance_core::links` so the two clients cannot drift,
+  and it learned to stitch hard-wrapped rows back together. That is not a
+  nicety on a phone: a pane is ~45 columns there, so a PR URL is always in two
+  or three pieces, and per-row detection hands back a fragment that opens
+  nothing. A row that runs to its last column is the only wrap signal a
+  snapshot carries (no WRAPPED flag on the wire), capped at six rows.
+
+### Fixed
+
+- **Web pins stop evaporating.** Two causes, both twins of desktop bugs.
+
+  `reconcile` pruned the arrangement straight against the circles the daemon
+  had named, and quicklaunch pins the instant you press the button — so the
+  `State` crossing that spawn on the wire carried no such circle and took the
+  pin with it. It pinned, then silently unpinned. Pins on unconfirmed circles
+  are now shielded until the circle shows up (`settle_absent`, which moved to
+  `seance_core::util` so the two clients cannot drift again — native got this
+  fix in 0.26.0 and the browser never did).
+
+  And a pin made in the browser never reached the daemon at all: this client
+  wrote localStorage only, while `load_rail_prefs` adopts the daemon's copy on
+  every connect. So a pin survived until the next reload and was never visible
+  at the desk. Deliberate changes (pin / unpin, including the launch pin) now
+  go through `FsOp::SubsSave` like native; incidental churn — marking a circle
+  seen, a prune — stays local, as it does there. The push PATCHES the daemon's
+  own blob rather than serializing this client's narrower shape over it, so
+  native's folds and flipped-pane face survive a pin made on the phone, and
+  our own broadcast echo is ignored (`rail_prefs_is_foreign`, also now shared).
+
+## [0.26.1] — 2026-09-12
+
+### Fixed
+
+- **Circles stop trading places, without pretending to know who is working.**
+  The rail ranked idle circles by their raw output clock. Any TUI that repaints
+  on a timer therefore reordered the list on every repaint — codex does exactly
+  that, so its circles churned for as long as they were open.
+
+  The idle band now ranks by a TEN-MINUTE bucket of the age, not the clock.
+  Everything inside ten minutes ties and falls back to name order. The bucket
+  has to be far wider than the jitter: an agent TUI repaints then pauses, so
+  its age sweeps up and back across whatever edge you pick. Measured on the
+  live rail — per-second ranking reordered 4x in 24s, per-minute still
+  reordered as circles swept the 60s edge, ten-minute produced 0 reorders in
+  40s. `rel_label` still shows the precise age; that is a fine thing to read
+  and a terrible thing to sort on. `recency_rank` lives in `seance-core` beside
+  `title_looks_busy` so the native and web rails cannot drift.
+
+  The working band stays gated on the title spinner, which in practice means
+  claude. An interim fix had counted recent output as working, on the theory
+  that output is the one signal every agent emits — it is not a signal of
+  WORK. Sampled over 20s, codex's output clock advanced by the full elapsed
+  time on three idle circles, so every codex circle read as permanently
+  working. Codex puts no working state in its title either (14 samples: `vita`,
+  `<task> | vita`, static), so for a non-spinner agent the honest answer is
+  "unknown" — and the ranking above means unknown circles sit still rather than
+  churn.
+
+  The finish-touch is gone: bumping a circle's clock when it left the working
+  band was a second reorder on top of the one its own output clock already
+  produced, and it fired for circles whose edge nobody observed.
+
+- **A blank window's pins are real pins.** The blank-window gate lived in
+  THREE places on the arrangement path and removing two of them fixed nothing:
+  the local cache was written, `push_rail_to_daemon` still bailed, and boot
+  loads the daemon's copy over the local one — so a pin placed in a blank
+  window rendered, persisted nowhere boot reads, and was gone on restart. The
+  daemon's copy had not been written in two days while pins were being placed
+  daily.
+
+  `empty_window` no longer gates anything on the arrangement path at all.
+  Blank-ness is about what a window ATTACHES to, not about whether your choices
+  count; what protects the shared copy is the deliberate/incidental split, not
+  the window's blank-ness. Blank windows also adopt the arrangement at boot —
+  skipping that left one showing an empty pinned band, which reads the same as
+  losing your pins.
+
+- **`restart-gui` stops manufacturing blank windows.** It sent SIGTERM and
+  relaunched immediately — but `kill` returns when `kill(1)` exits, not when
+  the target does, and a GUI takes a moment to tear down its GPU context. The
+  new process saw the old one still in `pgrep` and came up as a BLANK second
+  window, which (see above) then silently discarded everything you pinned in
+  it. It now waits for the killed pids to actually leave `/proc`, with a 5s
+  deadline and a SIGKILL for stragglers.
+
+## [0.26.0] — 2026-09-10
+
+### Added
+
+- **Paste on the phone.** The keyboard accessory bar has a `paste` key, stacked
+  above `done`. It reads the clipboard and bracketed-pastes it into the focused
+  pane through the same `seance_mobile_text` seam typing uses. iOS only lets a
+  long-press Paste menu target a visible editable element and the catcher is
+  1px behind the bar, so there was no reachable paste at all before this.
+  Anything that refuses `navigator.clipboard.readText()` — an http origin, a
+  denied permission, Firefox — falls through to a sheet with a real textarea
+  you can long-press into, so there is always a path.
+
+### Fixed
+
+- **A working agent reads as working again.** `title_looks_busy` matched only
+  the braille spinner, but Claude Code emits circle quadrants now — sampled
+  live, working panes alternated `◐`/`◑` while idle ones sat on `✳`. So the
+  daemon reported "not busy" for every working circle: none of them entered
+  the working band, they all fell into the idle band, and their rows churned
+  against the activity clock — two circles visibly trading places while both
+  worked. Both quadrant frames plus the rest of that rotation now count as
+  busy; `✳` still does not. **Needs the DAEMON replaced, not just the GUI** —
+  the daemon is the authority on busy and broadcasts the verdict.
+
+- **A quicklaunch circle stays pinned.** Quicklaunch pins the instant you
+  click, but the spawn is a round trip, so any `State` composed in that window
+  carried no such circle and `prune` took the pin with it — it pinned, then
+  silently unpinned. Pins on unconfirmed circles are now shielded from `prune`
+  until the circle shows up, or for 15s if it never does.
+
+- **Pins stick, and clicking a circle no longer moves it.** One bug wearing two
+  faces. `push_rail_to_daemon` spawned a thread per call, so two quick actions
+  raced and whichever thread won landed last — pin-then-unpin could persist as
+  unpin-then-pin. Worse, the daemon broadcasts every write back to *every*
+  window including the sender, and the sender adopted it wholesale: a window
+  would overwrite fresh local state with an older copy of its own. That is a
+  pin undoing itself.
+
+  It also explains the jumping rows. Selecting a circle writes the arrangement
+  (it marks the circle seen, to clear `needs`), so a click round-tripped
+  through the same path and could adopt a different `pinned` set, which
+  re-partitions the rail — the clicked circle appeared to leap up the list.
+
+  Writes now go through one long-lived, newest-wins writer, so the last thing
+  you did is the last thing the daemon sees. Inbound `RailPrefs` is ignored
+  while a write of ours is queued or in flight, and ignored when it matches
+  what we last sent; a genuine change from another window still lands.
+
+- **ctrl+click opens the link you clicked.** It ignored the click position
+  outright — `pos`, `cell_w` and `line_h` were all discarded — and opened the
+  first OSC-8 link on screen, falling back to the first bare URL anywhere in
+  the visible grid. In a pane whose scrollback held a PR reference above a
+  plat URL, clicking the plat URL opened the PR. It now maps the click to a
+  cell (the same `cell_at` drag-select already used) and resolves the link
+  covering that cell, or nothing. Column is a char offset, not a byte one, so
+  a wide glyph left of the URL doesn't slide the hit box.
+
+### Changed
+
+- **The rail is two bands with no headers.** Was four (pinned / active /
+  sleeping / parked), then three; now pinned rows sit above a full-width rule
+  and everything else sits below it. Nothing else is chrome. A slept circle
+  keeps its place in the sort and says so with its own row styling instead of
+  being relegated to a band, which is what you actually want when the sleep
+  was the daemon's idea rather than yours. The rule only draws when something
+  is pinned.
+
+  Bands are no longer foldable — their headers were the only affordance — so
+  `collapsed` holds prefix-cluster keys only, and `prune_collapsed` sweeps the
+  bare band keys older blobs carry (`parked`, `sleeping`, `active`). Cluster
+  folds are untouched, and still scoped per band.
+
+- **The selected circle is legible.** `selected_row_fill()` was `border()`
+  (L19) against an L10 rail — nine points of lightness, easy to lose down a
+  long list. Now a lifted warm charcoal at L28, with the web client's `--sel`
+  matching it (it had been on `--surface`, which was worse).
+
+### Removed
+
+- **Parking is gone.** The rail was four bands — pinned, active, sleeping,
+  parked — and the parked one earned its keep back when park meant "hide this
+  from THIS window". Since 0.23 made the arrangement daemon-owned it applied
+  everywhere, which left it a second way to say "get this out of my sight" next
+  to folds, and a worse one: a parked circle kept running where nobody could
+  see it. Three bands now, and every window subscribes to every circle.
+
+  What replaces it: fold a band or a prefix cluster. That already existed, it
+  is per-cluster rather than per-circle, and it does not hide a live process.
+  To actually stop a circle, sleep it.
+
+  Also gone: `GuiRequest::Unsubscribe`, `SubscriptionsPref.active`,
+  `Section::Parked`, the park / add-to-active row menus on both clients, and
+  the `Attach` subscription seed for non-blank windows (blank windows still
+  attach with `Some(vec![])` and stay blank). The `needs` badge survives with a
+  simpler rule — a circle this window has never selected, which is still how a
+  `ctl` spawn announces itself. Older `subscriptions.json` blobs and
+  `localStorage["seance_active"]` blobs carry an `active` key that is now
+  ignored rather than fatal, so pins and folds cross the upgrade intact.
+
+- **Links no longer open in scry.** `localhost` and `ham.xyz` urls went to
+  scry's control socket since 0.22.0; every link now goes to the default
+  browser, same as every other host always did. `src/scrylink.rs` is deleted
+  and `sysopen` is the plain xdg-open/open seam again. Opening still runs off
+  the calling thread — that's the child reap, not the routing.
+
+## [0.25.7] — 2026-08-28
+
+### Changed
+
+- **The notes face is daemon-owned.** Which pane is flipped to its notes side
+  used to be per-window and per-launch: quit seance with notes up and it came
+  back a terminal, and the mac never knew the desk had it open at all. It now
+  rides the same blob as the rest of the rail arrangement
+  (`SubscriptionsPref.flipped`, `SubsLoad`/`SubsSave` → `RailPrefs`), so a
+  restart opens on the face you left up and flipping anywhere flips everywhere.
+  Old blobs without the field read as "no face up". The browser client has no
+  notes face and never writes the arrangement, so it can't drop the field.
+
+### Fixed
+
+- **A restored notes face doesn't take the keyboard.** Walking into a circle
+  whose pane is notes-up put the cursor in the notes editor, so the next
+  `cmd+down` typed into the pad instead of moving on. Only an explicit flip or
+  a click focuses the editor now; a face that goes up because the arrangement
+  said so goes up unfocused, and the pane parks the keyboard on the app root
+  where the chords still fire.
+
+  Underneath, the focus pass used to switch itself off entirely whenever
+  *anything* was flipped (`flipped.is_none()`), which is why focus stayed in a
+  pad belonging to a circle no longer on screen — and would have stranded the
+  keyboard at launch once a flip could survive a restart. The guard is now the
+  precise thing it was reaching for: leave focus alone while it's in a notes
+  editor **this frame renders**, and recover in every other case. A notes-up
+  pane's terminal is no longer a legal focus target, since it isn't in the
+  frame to focus.
+
+## [0.25.6] — 2026-08-28
+
+### Added
+
+- **The mac's missing page keys.** A mac keyboard has no PageUp/PageDown, which
+  put both cycles behind `fn`: `ctrl+shift+fn+up` to reach the next pane is not
+  a chord anyone presses twice. With cmd held, the up/down arrows now stand in
+  for the page keys — `cmd+up`/`cmd+down` cycles circles, `cmd+shift+up`/`down`
+  cycles panes inside one. Cmd-only, deliberately: `ctrl+shift+arrows` is
+  spatial pane nav and bare `ctrl+arrows` is a PTY sequence, so neither was
+  available to borrow.
+
+  The cost is that `cmd+shift+up`/`down` no longer navigates the tile grid
+  vertically — spatial nav is `ctrl+shift+arrows` on macOS, and
+  `cmd+shift+teft`/`right` still reaches it since only the vertical pair is
+  claimed.
+
+## [0.25.5] — 2026-08-28
+
+### Added
+
+- **On a mac, cmd is the chord key too.** Every seance chord that reads
+  `ctrl+shift+<key>` now also answers to `cmd+shift+<key>` on macOS — summon,
+  kill, rename, pin, popout, notes flip, palettes, zoom, overview, spatial
+  arrows, the rail digits, and `cmd+pgup`/`pgdn` for circles. Ctrl keeps
+  working; this is a second spelling, not a move. Cmd was free to take: the
+  terminal view already swallows every cmd combo on macOS (that's where
+  `cmd+c` / `cmd+v` live), so no key was reaching a TUI to lose. Linux is
+  deliberately left out — `platform` is the super key there and the window
+  manager owns it.
+
+  Two chords stay ctrl-only in practice: macOS grabs `cmd+shift+3/4/5` for
+  screenshots before an app ever sees them, so rail rows 3–5 want
+  `ctrl+shift`. The help overlay says so.
+
+### Fixed
+
+- **A woken circle paints again.** Awakening a slept circle brought back the
+  frozen pre-sleep screen and then stopped there: typing put a character or two
+  on the glass and nothing more, until you left the circle and came back. The
+  frames were arriving the whole time — the client was throwing every one of
+  them away. `rev` is how a client tells a frame it hasn't painted from one it
+  has, and it drops anything not *greater* than the last rev it applied. A woken
+  pane is a new `PtySession`, and a new session starts counting at 1, thousands
+  of revs below where the old one died, so the frozen frame outranked every live
+  frame behind it. (The character or two was local echo, which deliberately
+  leaves `rev` alone. Switching circles fixed it because that path already zeroes
+  the rev gate.) A replacement session now resumes the count above the frame the
+  pane went to sleep on (`PtySession::seed_rev`), and waking also drops the
+  daemon's damage base and every window's claim to one — so the first frame back
+  is a whole grid for every window watching the circle, not just the one that
+  clicked awaken.
+
+- **A daemon that refuses the client now says so on screen.** The version gate
+  has always answered a stale client with a sentence naming the fix — but the
+  GUI never read it. A mac thin client left on 0.24.0 against a 0.25.4 daemon
+  opened its window, hello'd, got refused, and reconnected every 400ms forever:
+  empty rail, no circles, no error, nothing in the UI to distinguish "the
+  daemon turned me away" from "there is nothing here yet". Three changes, all
+  aimed at that silence:
+
+  - **Boot asks first.** `gui_client::preflight` hellos as `ctl` and reads the
+    answer before a window opens; a refusal routes to the launch picker, which
+    already renders errors. Applies to the local daemon too, not just the ssh
+    tunnel — a socket that accepts a connection is not yet a daemon that will
+    talk to *this build*.
+  - **Mid-session refusals reach the app.** The reader thread forwards the
+    daemon's text as `GuiEvent::Error` instead of only `eprintln!`-ing it into
+    `gui.stderr.log`, and the window carries a sticky ⚠ bar until a successful
+    attach clears it. This is the path a live thin client takes when the daemon
+    it's attached to gets upgraded underneath it.
+  - **Backoff.** A refusal is a standing condition, not a blip — retry every 5s
+    instead of every 400ms, and stop repeating the disconnect line.
+
+- **A remotely-spawned daemon keeps a log.** `ensure_daemon` sent the daemon's
+  stdout/stderr to `/dev/null`, which is exactly the daemon nobody can see: the
+  one a thin client starts over ssh with no terminal on either end. It now
+  appends to `<state-dir>/daemon.log` (rotating to `.1` past 5 MiB, falling back
+  to null if the file won't open), stamped with the requesting pid and build.
+  The first run of it caught a bind failure that "daemon did not become ready"
+  had been hiding.
+
+## [0.25.4] — 2026-08-18
+
+### Added
+
+- **`ctrl+shift+1 … 9` jumps to the nth circle down the rail**, counted the way
+  you read it — `1` is the top row, the same jump `ctrl+shift+home` makes. It
+  walks the same live list `ctrl+page` does, so folded bands aren't counted
+  (they're not on screen), and an out-of-range row is a no-op rather than a
+  clamp: pressing 7 on a five-circle rail means you were counting a rail that
+  isn't there, and landing somewhere arbitrary is worse than nothing.
+
+  Native reads the digit *or* its US-layout shifted symbol, because
+  compositors differ on which one `ctrl+shift+1` arrives as. The web client
+  keys off the physical `code` instead, and takes no `alt+` twin — `alt+<digit>`
+  switches browser tabs.
+
+## [0.25.3] — 2026-08-18
+
+### Added
+
+- **`ctrl+shift+home` jumps to the top of the rail** — the first pinned circle
+  if anything is pinned, else the top of active (a working agent, else the most
+  recent), and so on down the bands. It reads the same live list `ctrl+page`
+  walks, so it lands where your eye already is rather than on a remembered
+  position, and folded bands stay out of it. `home` because the chord should
+  say *go to the top* without a letter to memorize; both clients (the web twin
+  answers to `alt+home` too, and holds that key even on an empty rail so the
+  browser's homepage shortcut can't fire).
+
+## [0.25.2] — 2026-08-18
+
+### Changed
+
+- **Launch buttons open their circle pinned.** A quicklaunch chip already made
+  a fresh circle named after the entry; now that circle arrives in the pinned
+  band instead of sorting in among circles you last touched days ago. Pressing
+  a launch button says *this is what I'm doing now*, and the host-menu chips
+  sitting next to them already worked this way. Both clients. Unpin from the
+  row menu or ctrl+shift+p when it's done.
+
+## [0.25.1] — 2026-08-17
+
+### Changed
+
+- **`ctrl+shift+p` pins the selected circle** (toggle), and pane **popout moves
+  to `ctrl+shift+o`**. Pin is a rail verb reached constantly; popout is a
+  once-in-a-while move that still has its `⇱` button and its row menu. The web
+  client keeps `ctrl+shift+p` for the latency probe — a divergence the grimoire
+  already documents.
+
+## [0.25.0] — 2026-08-17
+
+### Added
+
+- **File panes copy.** Two buttons in the pane header: `⧉ path` puts the file's
+  full path on the clipboard, `⧉ md` (`⧉ text` for a non-markdown file) puts
+  the body there. Reading a doc in a pane and then wanting to hand it to
+  someone — a path into a prompt, a section into a message — was a trip back to
+  a shell for a file you were already looking at.
+
+  What copies is the **source**, not the render: a folded outline still yields
+  the whole document, and while pinned to history it's that snapshot's text —
+  which the tooltip says out loud, because a silent copy of not-the-live-file
+  is the paste you'd trust wrongly.
+
+### Changed
+
+- The Wayland copy detour (ownership in a `wl-copy` child, because GPUI's
+  in-process write has killed the GUI with no panic to show for it) moves out
+  of the terminal view into `src/clipboard.rs`. One copy seam, so the next
+  surface that copies inherits the hard-won part instead of re-deriving it.
+
+- **Pin leads the circle's right-click menu** (both clients). It's the item
+  aimed at the rail the row lives in, and the one reached for often enough to
+  want under the cursor.
+
+### Removed
+
+- **`touch (bump recency)`** — the manual bump. Recency already moves on its
+  own (typing in a pane, a circle finishing work, a circle being created), so
+  the menu item was a hand crank on a motor that runs. The automatic clock is
+  untouched.
+
+- **`fork workspace ⑂`, end to end** — never used, in a year of daily driving.
+  Gone with it: `seance ctl fork`, `ControlRequest::WorkspaceFork`,
+  `GuiRequest::ForkWorkspace`, the engine's respawn-and-copy-scratchpads
+  implementation, the `workspace_fork` capability, and the web client's menu
+  entry. **This is a wire break** — hence the minor bump, and both clients plus
+  the daemon have to land together (see the version-lockstep rule).
+
+## [0.24.0] — 2026-08-16
+
+**Remote seance stops shipping whole screens.** Measured end to end by
+replaying a real two-hour session's recorded frames through the new path:
+**196 MB → 5.9 MB on the wire, 33x**, and the framing the daemon picks went
+from 2,500 full grids to 2.
+
+The starting point was a report that a remote window felt slow while a local
+one did not. The daemon was healthy (`input→gridpush` p50 3.0ms) and the link
+was not saturated (94 KB/s on a 20Mbps, 36ms path), so neither end was the
+problem. What the recorder showed was the shape of the traffic: on a busy pane,
+**full grid frames were 16% of frames but 92% of bytes**, averaging 55KB raw —
+74KB after the base64 the wire uses — arriving up to four times a second. A
+74KB frame is ~60 packets that a keystroke's echo has to queue behind on the
+same TCP connection, which is what "slow" felt like.
+
+Four causes, all fixed:
+
+### Added
+
+- **`SCZ3`, a deflate container for grid frames.** Terminal grids are extremely
+  compressible: measured over 200 real full frames, 55,551 B → 4,558 B
+  (**12.3x**), and row damage 3.8x, at 0.5ms per frame. It is a pure container
+  — an ordinary SCG3 frame lives inside — so the recorder, the replay player
+  and the frozen-pane store keep reading and writing raw frames, and
+  `decode_grid_bin_onto` unwraps it for both clients at once. Level 6 chosen on
+  measurement: level 1 gave only 7.9x for a quarter of the time saved.
+
+- **`FRAME_SCROLL`: the screen scrolled, here are the rows that appeared.**
+  Output arriving at the bottom of a terminal changes every row, which read as
+  "more than half the screen changed" and sent a whole grid. It is now a shift
+  the receiver applies before the damage rows. **A scroll frame is exact
+  whatever delta the sender guesses**, because every row that does not match
+  after the shift is carried in the body — detection quality only ever costs
+  bytes, never correctness, which is what makes guessing safe.
+
+- **Header-only frames.** A spinner tick in the OSC title changes no cells and
+  used to cost a full grid; it now costs a few dozen bytes. That path alone was
+  9.7 MB of one 30-minute segment.
+
+- **A send window (`GuiRequest::GridAck`).** The 0.23 coalescer bounds the
+  daemon's own queue, but ~2.4MB sits downstream of it that the daemon cannot
+  see or merge: the unix send buffer, ssh's 2MB per-channel window, the TCP
+  send buffer. That is where the 1053ms in the coalescer's own measurement was
+  hiding. Clients now ack the frames they receive and the daemon keeps at most
+  8 in flight, merging the rest — so staleness is capped at frames rather than
+  megabytes. A client that never acks degrades to the old behavior after a 2s
+  stall rather than freezing, and this closes the same hole in the web bridge
+  (whose ws pump has its own unbounded queue) without touching it.
+
+- **Instrumentation for the stage that was dark.** The daemon measured up to
+  `gridpush` and the GUI measured from `bridge age`; nothing measured the queue
+  and socket in between. Now `daemon grid queue wait` and `daemon socket write`
+  do, plus a `[seance vol]` line carrying wire bytes and rate — the number that
+  had to be reconstructed from `ss` counters to find this in the first place.
+
+- **`-C` on the ssh forward.** Frames arrive deflated now, but they ride base64
+  inside JSON lines and the control chatter around them is plain text.
+
+### Changed
+
+- **Framing is decided per connection, not globally.** Damage is only
+  meaningful to a receiver holding the base it names — a per-connection fact
+  that was being answered for everyone at once. Three amplifiers came out of
+  that: a frame was promoted to a full grid for *every* window whenever any
+  recipient lacked a base (an overview thumb watcher was enough); `Attach`
+  cleared the daemon's shared last-frame cache, so **one window reconnecting
+  cost every other window a full grid for every pane it was watching**; and the
+  post-attach `ForceFullGrid` fired at everyone. Each is now scoped to the
+  window that actually needs it. If the per-connection base is ever wrong the
+  receiver's decode fails and it asks for a refresh — the error path is a
+  resync, not a corrupt screen.
+
+- **Wire version is a break.** Old clients cannot decode `SCZ3` or
+  `FRAME_SCROLL`; the daemon's exact-build hello check already refuses them.
+  Rebuild the web bundle (`./scripts/build-web.sh release`) with the daemon.
+
+### Fixed
+
+- **Grid frames coalesce per connection, so a bad link no longer makes you
+  watch a backlog drain.** The daemon handed every push to an unbounded
+  `mpsc` feeding a blocking socket write. On a healthy link that's free — the
+  queue is always empty. On a degraded one it was the whole problem: the write
+  blocks, the engine keeps generating frames at up to 62fps, and they pile up
+  with no ceiling, so every frame that arrives is already stale. Measured on a
+  bad wifi association: `key→grid-apply` p50 **1053ms**, max **8355ms**, while
+  every GUI-side stage stayed under a millisecond — `bridge age` 0.0ms, `grid
+  apply` 0.2ms, `gpui draw` 7.5ms. The GUI was fine. It was drinking from a
+  queue.
+
+  `runtime::outqueue` keeps **one pending frame per pane** and merges into it.
+  The merge is exact, not lossy, which is what makes it cheap: damage is a
+  list of dirty *row indices* and the payload is the current snapshot
+  restricted to those rows — not a diff against a base. So composing N queued
+  frames is "union the row sets, encode against the newest snapshot". No delta
+  chain to break, and therefore **no full-frame resync** — which would have
+  meant sending *more* bytes exactly when the link can least carry them.
+
+  Healthy link: the queue is empty when each frame arrives, nothing merges,
+  behavior is identical to before. Degraded: the backlog collapses to the
+  newest state per pane. Recovery is immediate and automatic — there's no
+  threshold, no hysteresis, and deliberately **no rate controller**, because
+  once the queue can't back up the effective frame rate already *is* the
+  link's measured capacity. A controller on top of that is two feedback loops
+  fighting.
+
+  Promotes to a full frame on a reflow (row indices stop naming the same
+  cells) and once the union passes half the rows — the same threshold
+  `broadcast_grid` already uses to pick damage over full in the first place.
+
+  Encoding moved to drain time, so a backed-up connection encodes once per
+  frame it actually sends instead of once per frame it never sends. The CPU
+  saving lands on the machine that's already struggling.
+
+  Only grids coalesce. `State`, `Ack`, `PaneSpawned`, `RailPrefs` hold strict
+  FIFO — dropping one is a correctness bug. `State` was left uncoalesced on
+  purpose despite being a complete latest-wins snapshot: it fires on discrete
+  events (exit, title, spawn), not on the output path, so it isn't a volume
+  problem, and a smaller change is the right one to make to a daemon someone
+  else now depends on.
+
+  Daemon-side only — no wire change, so `seance upgrade` alone delivers this
+  to already-running GUIs.
+
+- **⌘Q quits the macOS app.** Shipping the `.app` in 0.23.0 removed the only
+  way to stop seance without adding one: there's no terminal to ctrl-C, and
+  closing the window doesn't quit on macOS. The app had no menu bar at all, so
+  ⌘Q hit nothing and force quit was the only exit. There is now a Seance menu
+  with a Quit item; `cx.on_app_quit` already tore the ssh tunnel down, so the
+  action only has to ask.
+
+  Quit only. Hide / Hide Others / Show All are zed's own actions rather than
+  gpui's and would each need a real implementation — a menu item that looks
+  standard and does nothing is worse than no item.
+
+## [0.23.0] — 2026-08-13
+
+Your rail follows you to the other machine. And seance is an app on macOS.
+
+### Changed
+
+- **The daemon owns the rail arrangement.** Active/parked, pins, `seen`, and
+  fold state moved from each client's `~/.config/seance/subscriptions.json`
+  into the daemon's state dir beside `layout.json`, reached by two new
+  `FsOp`s (`SubsLoad` / `SubsSave`). Open a window anywhere — desk, mac thin
+  client — and the same circles are there, in the same bands, with the same
+  ones pinned. Pin at the desk and the laptop's rail updates while you watch:
+  a save broadcasts `GuiEvent::RailPrefs` to every attached window.
+
+  This reverses a deliberate 0.12 decision, so it's worth saying why it was
+  wrong. The old reasoning was that the active band is *this window's chrome*
+  — true of tiling, which is why layout went daemon-side, and false of the
+  rail. Which circles you keep in front of you is a fact about what you're
+  working on, not about which machine you opened. Eleven pinned circles at
+  the desk and a blank rail on the laptop wasn't a second view of the work,
+  it was the arrangement failing to exist anywhere but one box.
+
+  The local file survives as a **seed cache**, demoted from source of truth.
+  It's read before connecting because `Attach` needs a seed, and opening on
+  the arrangement you last saw beats attaching to all 47 circles and
+  unsubscribing 35 of them a beat later. The daemon's copy is read straight
+  after connecting and wins.
+
+  Two edges worth knowing. A window that adopts the daemon's arrangement is
+  still *attached* on whatever it seeded with, so the next `State` pushes the
+  arrangement onto the connection rather than folding the connection's
+  subscriptions into it — otherwise a fresh window, which attaches to
+  everything, would bloom its rail back to every circle the instant it
+  opened. And the broadcast goes to every window including the sender, so
+  receiving one adopts without saving; saving in response would put one pin
+  into an endless round trip.
+
+  A daemon with no copy yet is seeded by the first window that connects,
+  which donates its arrangement instead of everyone starting from a blank
+  rail. Pushes run off the UI thread — pinning a circle shouldn't wait on a
+  socket, least of all over ssh from the mac.
+
+### Added
+
+- **`./scripts/bundle-macos.sh` builds `/Applications/Seance.app`.** Finder,
+  Spotlight, the Dock, ⌘-tab — the mac ways of starting a program all reach
+  seance now, instead of only a terminal that has the repo's `target/release`
+  on its PATH. `--user` installs to `~/Applications` for a box where
+  `/Applications` isn't writable, `--no-build` bundles what's already built,
+  `--dest` puts it anywhere.
+
+  The bundle holds a **copy** of the binary, which makes this the mac build
+  command rather than a step after one — a bare `cargo build --release`
+  leaves the app stale. A symlink into `target/` would have kept them in
+  sync, but the main executable of a signed bundle has to live inside it, and
+  the ad-hoc signature is what lets the app hold onto its identity — and its
+  TCC grants — across reinstalls. With a warm target dir the whole script is
+  a few seconds, so re-running it is cheaper than remembering which of two
+  commands you last ran.
+
+  Panes needed nothing special to survive the move. They spawn `/bin/bash
+  -lc`, so a login shell rebuilds `PATH` from the user's dotfiles and `claude`
+  resolves the same from Finder as from a terminal — the usual GUI-app
+  environment problem doesn't arise, and no `LSEnvironment` hardcoding was
+  added to fake it.
+
+- **`assets/icons/seance-macos-1024.png`** — the candle at macOS icon
+  proportions (824pt of art centered in 1024, matching Apple's grid), so
+  `sips` + `iconutil` can build the `.icns` on a mac with no SVG rasterizer
+  installed. Committed rather than rendered at bundle time for exactly that
+  reason.
+
+## [0.22.0] — 2026-08-10
+
+Links to pages we publish open in scry.
+
+### Added
+
+- **`localhost` and `ham.xyz` links open in scry, in the `general`
+  workspace.** Ctrl/middle-click in a terminal, a PR chip, a pad link, a row
+  in the PR board — every link in the app goes through one seam now, and the
+  hosts we publish to route to [scry](https://github.com/zackham/scry), the
+  browser for pages we control. Everything else keeps the default browser
+  exactly as before.
+
+  It talks to scry's **control socket** (`~/.local/share/scry/control.sock`,
+  JSON lines) rather than shelling `scry ctl`, which needs its repo's
+  `run.sh` to find `libcef.so` — that would have meant hardcoding a clone path
+  from someone's home directory into this app. The socket is a stable location
+  and needs no binary.
+
+  **Every failure path lands in the default browser**: no socket, scry not
+  running, a wedged scry, a reply we can't read, an external url scry refuses.
+  A link that goes nowhere would be worse than a link in the wrong browser.
+  Host matching respects the label boundary, so `ham.xyz.evil.com` is not our
+  host, and userinfo can't name one (`https://ham.xyz@evil.com` is evil.com) —
+  the same traps scry's own `policy.rs` documents, ported with its tests.
+
+  Loopback *addresses* deliberately aren't routed even though scry blesses
+  them, so nothing that only ever spoke to `127.0.0.1` moves without being
+  asked. Opening now runs off the calling thread, since the routing decision
+  costs a socket round trip and every caller in the GUI is a click handler.
+
+## [0.21.0] — 2026-08-10
+
+The mouse's back and forward buttons walk the circles you've been in.
+
+### Added
+
+- **Mouse back / forward navigate between circles.** The side buttons on the
+  mouse now step through this window's visit history — back to the circle you
+  were just in, forward to undo it. It works over a terminal, over the rail,
+  anywhere in the window; panes forward no button events to the PTY, so
+  nothing downstream wanted them.
+
+  This is a *path with a position in it*, not the recency ranking the jump
+  palette shows. Recency is a set sorted by a clock, so it reshuffles under
+  you while agents finish; back-then-forward has to land you back exactly
+  where you left, which only a cursor into an ordered path can promise. Going
+  somewhere new after stepping back drops the forward half, same as a browser.
+
+  History is kept by **watching** the selection once per render rather than by
+  each caller remembering to record. The selection moves from a dozen places —
+  the rail, ctrl+page, the jump palette, clicking a pane that lives in another
+  circle, parking the circle you're in, a `ctl` spawn pulling the window
+  across — and the daemon can move it without this window asking. Watching
+  catches all of them; asking every caller catches the ones I thought of
+  today. A circle that's been banished is stepped over, not pruned, so
+  forward still retraces the same path. Per window, never persisted — a new
+  window starts empty, like a new browser tab.
+
+## [0.20.1] — 2026-08-06
+
+### Changed
+
+- **Markdown panes open folded to their outline** rather than fully expanded —
+  every heading on screen, no prose. Seeing a long document's shape is usually
+  why it's in a pane. `⊞` opens everything; a section you expand stays expanded
+  across rewrites, while one that appears after the pane opened arrives folded,
+  so an agent appending to a file can't dump prose into a view you'd arranged.
+- **"Fold everything" now means the leaves, not every heading.** Collapsing
+  hides a subtree, so the previous behaviour folded a document's `#` title too
+  and collapsed the whole thing to a single line — obedient and useless.
+  Folding the leaves is the deepest fold that still shows the shape of what was
+  folded, and it leaves a parent's preamble visible.
+
+## [0.20.0] — 2026-08-06
+
+Markdown panes fold.
+
+### Added
+
+- **Foldable sections in markdown file panes.** Click a heading's caret to
+  collapse its section — the whole subtree, not one level — or use `⊟` / `⊞`
+  in the pane header for all of them. A flat 200-line agenda becomes its
+  eight-line spine, and a collapsed heading still says `N lines`, because a
+  fold that leaves no trace of its size reads like the document ends there.
+  The chrome appears only for markdown that actually has headings.
+
+  The fold happens **before** the renderer (`src/mdfold.rs`): a collapsed
+  section's lines are never handed to the TextView, and each heading becomes a
+  `seance-h` fence the file pane draws itself. So `gpui_component`'s markdown
+  stack — ~7k lines of parsing, inline layout and cross-block selection — is
+  untouched and unforked; it just receives a shorter document. Selection still
+  crosses a folded heading (the custom node carries its markdown as its text).
+
+  **Fold state is keyed by heading path, not by line.** The canonical file pane
+  is watching a document an agent is writing while a human reads it, and a
+  line-indexed fold set would silently reopen on every write, or fold the wrong
+  section. Path keys survive insertions above, edits elsewhere, and the section
+  moving; a fold is forgotten only when its heading is renamed, which is the
+  one case where there's no honest way to claim it still refers to that
+  section. Duplicate headings under one parent fold independently.
+
+## [0.19.0] — 2026-08-06
+
+Jumping remembers where you've been.
+
+### Changed
+
+- **`ctrl+shift+j` lists circles most-recently-active first**, instead of the
+  rail's order. The rail groups by band so it can hold still while agents start
+  and finish; jumping wants the opposite — the circle you were just in, then
+  the one before that — so the hotkey plus arrows walks back through where
+  you've actually been. Title says so.
+
+### Fixed
+
+- **The jump palette's three code paths disagreed about what was in the list.**
+  The row count arrows wrap against, the item Enter activates, and what is
+  drawn were computed separately, and two of them still included panes after
+  the list became circles-only (owner decision, 0.17). So the highlighted row
+  and the thing you jumped to were different entries, and often the jump landed
+  on a *pane* — which is also why it didn't move the rail. One shared source
+  now, pinned by tests.
+- **Selecting a circle reveals its row in the rail**, rather than only scrolling
+  toward it. Scrolling alone can't help when the target sits inside a folded
+  band or cluster — there is no row to scroll to, and the sleeping and parked
+  bands start folded — so jumping into one left the rail sitting where it was,
+  showing no sign of where you'd gone. It now unfolds what hides the row first,
+  then scrolls. Applies to every select: `ctrl+shift+pageup/down`, a jump, and a
+  host menu creating a circle all land the same way.
+- **A host menu's panel opens above its chip again**, instead of parked at the
+  foot of the rail. Fixing the click bug moved the panel out of the chip's
+  element tree, and the placement went with it — but "not a child of the chip"
+  and "not anchored to the chip" are different things, and conflating them is
+  what sent it to the corner. The chip now reports its painted bounds through a
+  side-channel (the idiom the terminal view already uses for cell metrics) and
+  the panel positions itself against them: left edge flush, growing upward,
+  clamped so a long list stops short of the window top rather than running off
+  it.
+
+## [0.18.2] — 2026-08-06
+
+### Fixed
+
+- **Picking a row in a host menu did nothing.** Two bugs stacked, both from the
+  panel being a child of the chip's layout when it is drawn nowhere near it.
+  First, dismissal used `on_mouse_down_out` on the chip — which fires in the
+  CAPTURE phase for any press outside *the chip's* hitbox, and the panel is
+  absolutely positioned outside it. Every click on a row was therefore read as
+  a click-away: the menu closed on mouse-down and the row was gone before
+  mouse-up could complete the click. Second, the panel was
+  `absolute().bottom_full()` inside a `deferred`, whose layout is detached from
+  its parent, so once dismissal was fixed the panel resolved to nowhere
+  visible. The panel now renders from the app root, positioned against the
+  window beside the rail, inside a full-window scrim that owns click-away.
+
+## [0.18.1] — 2026-08-05
+
+### Fixed
+
+- **`restart-gui` was killing the `seance web` bridge.** It found processes
+  with `pgrep -x seance` — which matches every surface, since they all share
+  the binary and therefore the process name — and spared only cmdlines
+  containing "daemon". So each GUI redeploy silently took down any running web
+  bridge, and said `stopped 3 gui process(es)` while doing it. Remote access to
+  seance disappearing as a side effect of shipping a UI change is the kind of
+  breakage you discover much later, from the wrong end. It now kills only a
+  cmdline with no subcommand at all (flags like `--local` / `--remote <host>`
+  are still the GUI); `web`, `ctl`, `replay`, `daemon` and anything else on the
+  binary survive.
+
+## [0.18.0] — 2026-08-05
+
+A host can hand seance a workflow it doesn't understand.
+
+### Added
+
+- **Host menus — a chip in the launch strip that asks its question when you
+  click it.** The host bridge already let an outside app own a strip in the
+  rail, but only by polling: every item became a permanent chip, so the shape
+  only fit small ambient state like which claude account is live. A menu is the
+  other half. `menus[]` in `host.json` names a `list_cmd` and a `select_cmd`;
+  the chip runs the list on click, drops the items into a dropdown grouped by
+  whatever the host said, and runs select on the row you pick. Nothing is
+  polled. Twenty rows in the rail would be a wall; twenty rows in a dropdown is
+  a list.
+- **A menu's `select_cmd` can hand back a `workspace`**, and the rail pins it
+  and jumps to it. That is the whole reason a menu can create a circle and have
+  it feel like a launch rather than a background event: a circle you just
+  deliberately conjured is the one you're about to work in, so landing it
+  somewhere you then have to go find defeats the point. Hosts that spawn
+  background work send `"pin": false`.
+- **First menu (vita's, not seance's): the week's meetings.** Click one and a
+  circle opens for that meeting — a claude pane in the vita repo, armed for
+  seance, handed the meeting's agenda prompt, and told to put the agenda up as
+  a live file pane beside itself so you watch it get written. Seance does not
+  know what a meeting is. It ran two commands the host configured; the workflow
+  is entirely `vita/scripts/seance_host_meetings.py` talking to `seance ctl`.
+  This is the seam working as intended: a host adds a workflow without seance
+  learning the workflow.
+
+### Fixed
+
+- **Clicking a pane no longer eats your clipboard.** A bare left click anchored
+  a one-cell selection, and releasing the button copied it — so clicking into a
+  terminal to focus it silently replaced the clipboard with one character. That
+  is a loss you only discover at paste time, when whatever you wanted is
+  already gone. Release now copies only when the gesture actually was a
+  selection: a drag covering more than one cell, or a double/triple click
+  (explicit "select that word/line", so a one-character word still copies). A
+  plain click clears the anchor instead of leaving a stray highlight.
+- **A pretty-printed host response could be read as an empty one.** Snapshot
+  parsing scanned for the last `{…}` line before trying stdout as a whole, and
+  every field of the snapshot has a default — so one indented *item* line
+  deserialized cleanly into a snapshot with no items. A host that formatted its
+  JSON got "no items", which is worse than an error because it looks like an
+  answer. Whole-stdout is now tried first, and the leaked-log line scan insists
+  on a line carrying `items` or `schema`.
+
+### Changed
+
+- The rail's launch strip is titled `── launch ──` (was `── vita quicklaunch
+  ──`). It holds two sources now, and neither of them is vita's by nature —
+  vita is just this machine's host.
+
+## [0.17.1] — 2026-08-05
+
+Design pass on the rail. Same theme, same information — far less work to read.
+
+### Changed
+
+- **One left axis.** The band caret, the cluster caret and every row's glyph
+  now share a single fixed 15px column, so band titles, cluster titles and
+  circle names all begin on the same vertical line. The rail used to have
+  three different left edges and your eye had to zig-zag down it.
+- **The glyph slot earns its ink or stays empty.** A diamond on every idle row
+  was a dozen identical marks that said nothing. Idle now draws nothing, which
+  is what makes the rows that *are* doing something impossible to miss. Order:
+  needs-human (violet ●) > working (spinner) > selected (◆) > asleep (☾).
+  Selection no longer steals the slot from a working circle — the flame anchor
+  says "here" instead.
+- **Bands and clusters read as different species.** A band is a landmark you
+  navigate by: uppercase, letterspaced, 11px, quiet, with air above and none
+  below. A cluster header is row-sized, because conceptually it is one of the
+  circles it holds.
+- **A cluster reads as one object** — a hairline runs down its members, and
+  the shared prefix is dimmed on each row (`mtg-`**growth**). The header above
+  already says the prefix; repeating it at full strength made you re-read it
+  on every line.
+- **One hard right edge.** Times and header counts share a fixed 34px
+  right-aligned column instead of a ragged gutter. Counts lost their
+  parentheses.
+- **The selected row has a flame anchor** down the left edge plus a `surface`
+  fill — the old fill alone was nearly invisible on a dark screen. The anchor
+  lives in the row's left inset, so text never shifts when selection moves.
+- **`needs-human` colours the whole row** (violet glyph + violet name) rather
+  than hiding in a badge; it is the one state that must not be missed. `done`
+  became a proper tinted pill instead of text floating mid-row. Sleeping rows
+  recede to 62%.
+- **Rows are 28px, down from 41.** Four bands and thirteen circles now fit
+  where nine circles used to.
+
+## [0.17.0] — 2026-08-05
+
+Four folding bands, and circles that cluster by the name you give them.
+
+### Added
+
+- **The rail is four folding bands: pinned, active, sleeping, parked.**
+  Sleeping is now its own band rather than circles sitting wherever they were
+  when they dozed off. A pinned circle stays pinned even asleep — a pin says
+  where you want to *look*, and the daemon dozing something is not a reason to
+  move it. Each band shows its count, and a folded band carries one dot for
+  the loudest thing hiding under it, so an agent asking for help is visible
+  without unfolding the pile.
+
+- **Circles cluster by the text before the first hyphen, per band,
+  independently.** Name three circles `mtg-growth`, `mtg-ai`, `mtg-carl` and
+  they gather under `mtg`. Grouping is a naming convention rather than a
+  stored attribute: you get it by typing, you undo it by typing, and it costs
+  nothing when you don't want it — which is the point when the grouping only
+  matters for an afternoon. A prefix only one circle carries is not a group,
+  and a name with no hyphen opts out. The `mtg` circles you're working in and
+  the `mtg` circles you've slept are separate piles that fold separately.
+
+  A cluster sits at the position of its **first** member, so it floats exactly
+  as high as its most-deserving circle would have on its own — the sort keeps
+  meaning what it meant. Matching ignores case; the header shows the prefix as
+  you first typed it. Grouping reads the **label**, so retyping a name is how
+  you regroup, and the slug underneath never moves.
+
+### Changed
+
+- **`ctrl+page` walks exactly what the rail is showing** — which now means
+  folds narrow it. Fold the bands and clusters you're not in and the rotation
+  is just your working set. Both GUIs.
+- Fold state persists per client (`subscriptions.json` / localStorage).
+  Untouched, `sleeping` and `parked` start folded; the first fold makes your
+  choices authoritative, so unfolding everything stays unfolded instead of
+  springing back to defaults. A cluster that stops existing takes its fold
+  with it.
+
+### Removed
+
+- The bespoke pinned-section + parked-accordion rendering in both GUIs, and
+  `partition3` — one generic band renderer replaced three special cases, and
+  the shared `seance_core::grouping` means the two rails cannot drift.
+
+## [0.16.0] — 2026-08-05
+
+A circle's name stops being its identity.
+
+### Changed
+
+- **A circle has a stable slug and a mutable label.** Panes have always had
+  this split — `slug` is the id, `name` is what you read — and it is why
+  renaming a pane costs nothing. A circle's display name *was* its key, so a
+  rename rewrote its identity and every holder of the old string had to be
+  migrated by hand: eight structures in the daemon, six more plus the pin/park
+  prefs in the native GUI, the same again in the web client. And one that no
+  migration can ever reach — the `SEANCE_WORKSPACE` already baked into a
+  running pane's environment. You cannot write into the environment of a
+  process that is already running, so under the old model **an agent in a
+  renamed circle could no longer tell `seance ctl` where it was**: its scope
+  named a circle that no longer existed, `list` came back empty and `send`
+  answered "outside your workspace".
+
+  The slug is now minted once, from the name the circle was created with, and
+  never rewritten. **Rename sets a label and nothing else** — panes, activity
+  clocks, PR links and dismissals, selections, subscriptions, per-GUI pin/park
+  prefs and every running pane's environment all keep pointing at the same
+  circle, because none of them moved.
+
+- **Addressing accepts either form.** An exact slug wins, then an unambiguous
+  label; a label two circles share resolves to neither and says so rather than
+  picking one — the same precedence pane lookup got in 0.14.2, for the same
+  reason. Resolution happens once at the daemon door, generically over the
+  serialized request on **both** the control and GUI planes, so a future op
+  carrying a `workspace` inherits it without anyone remembering. A key that
+  matches nothing is left verbatim: it goes on matching no circle rather than
+  being silently promoted to unscoped.
+
+- **`seance ctl whoami` answers from the pane**, not from the caller's
+  environment — the canonical "which circle am I in".
+
+### Added
+
+- `SEANCE_WORKSPACE_NAME` carries the circle's label for display.
+  `SEANCE_WORKSPACE` is the slug and is now genuinely stable. `ctl list` shows
+  `label (slug)` when they differ; `whoami` reports both.
+- **`seance ctl rename-circle [WS] NAME`** — agents can already create circles
+  (`ctl new --workspace`), so they can now label them too; rename was
+  GUI-only. Addresses by either form and sets the label, leaving the slug
+  alone like every other path.
+- Labels render in both GUIs — sidebar, overview, PR board, command palette —
+  and a new circle keeps the name you typed ("Growth Work" reads as itself
+  while being keyed by `growth-work`). The palette matches **either** form, so
+  you can find a circle by what you see or by what it is, and rename prefills
+  the label so you edit what you're looking at.
+
+### Removed
+
+- `rename_pr_links`, `SubscriptionsPref::rename` and `SubPrefs::rename` — the
+  three hand-written rename follow-throughs. Carrying a pin across a rename is
+  no longer something that can be got wrong, because the key those pins are
+  filed under does not move. Their tests were retargeted to assert the new
+  invariant rather than deleted.
+
+## [0.15.1] — 2026-08-04
+
+### Fixed
+
+- **Awaken lands the keyboard in the circle.** Every awaken affordance is a
+  click, and a click leaves focus on the thing clicked — the bar button, the
+  menu item — so waking a circle left you unable to type until you clicked a
+  pane. Both GUIs now focus the circle's pane as part of waking. Native holds
+  it in `pending_focus`, which survives the daemon round-trip and applies on
+  the first render after the relaunch; web focuses the pane and blurs the
+  button (a focused `<button>` also eats Enter/Space, which would re-fire the
+  wake). Same family as the summon and empty-circle focus bugs: the pane view
+  is alive the whole time, so nothing re-focuses it unless we say so.
+
+## [0.15.0] — 2026-08-04
+
+Sleep a circle you're done with. It stops costing RAM and keeps its mind.
+
+### Added
+
+- **Sleep / wake.** A sleeping pane has **no process** — the PTY is gone and
+  so is everything the agent was holding (a claude pane plus its MCP children
+  runs a few hundred MB; forty of them is most of a workstation). What
+  survives is everything that makes the pane itself: slug, name, circle, cwd,
+  command, its claude conversation id, scratchpad, task, status — plus the
+  **last frame it rendered**, frozen to `<state-dir>/frozen/<slug>.scg` and
+  served in place of a live grid, so a slept circle still reads with nothing
+  behind it. Waking relaunches `claude --resume <id>` in the same cwd.
+- **Only where it can be undone.** Sleep is offered for a claude pane with a
+  session id *and* a transcript on disk, or a file pane. A shell can't be
+  rebuilt — cwd drift, history, running children — so one shell vetoes its
+  whole circle, and the refusal names it. Sleeping is a deliberate crash;
+  it is only safe because 0.14.2 gave each pane its own conversation id.
+- **Reading a sleeping circle.** Its panes still show what they were showing,
+  dimmed to 45% with a scrim: readable, and unmistakably not live. The
+  **awaken bar sits above the tile area**, never over the content, and says
+  what you're looking at rather than letting a frozen frame pass for a live
+  one. Right-click a circle for `sleep circle` / `awaken circle`; the sidebar
+  marks it `☾`. Both GUIs.
+- **`seance ctl sleep [WS]` / `wake [WS]`**, and `ctl list` renders
+  `state=asleep`. **`ctl send` to a sleeping pane wakes it** — anything else
+  breaks every orchestrator the first time it addresses a circle that dozed
+  off. Typing into a sleeping pane wakes it too (the waking keystroke is
+  dropped rather than fed to a half-drawn prompt); scrolling doesn't —
+  reading the frozen frame is what it's for.
+- **Auto-sleep at 12h idle**, swept every 5 minutes. Restorable circles only,
+  and only ones with a real activity clock — no observation is not evidence
+  of idleness. Idle means the daemon's own clocks (last pane output, floored
+  by last human input), the same pair the sidebar row shows.
+- **Slept stays slept** across daemon restart and `seance upgrade`. Bringing
+  a slept circle back up on restore would defeat the entire point.
+
+## [0.14.2] — 2026-08-04
+
+A circle stops working on its own, and the working band holds still.
+
+### Fixed
+
+- **A finished circle leaves the working band without being clicked.** The
+  sidebar's working badge reads a pane's TUI spinner out of its OSC title —
+  but titles ride on grid frames, and grid frames only go to the window that
+  has that workspace *selected*. Every other circle's title was therefore
+  frozen at whatever it wore when you looked away: the spinner it had while
+  working. So a circle stayed "working" until you clicked it, at which point a
+  fresh frame arrived and it dropped out instantly — the click looked like the
+  cause. The daemon now owns the verdict (it is the only party that sees every
+  title) and **broadcasts busy flips to every connection, subscription-blind**
+  (`GuiEvent::PaneBusy`, edge-triggered; `PaneInfo::busy` seeds a fresh
+  attach). Both GUIs read that instead of a local title. One detector,
+  `seance_core::util::title_looks_busy`, shared by daemon and both clients.
+
+### Changed
+
+- **The working band sorts A–Z**, in both GUIs. It used to sort by when each
+  circle started working, which meant the top of the sidebar reshuffled every
+  time an agent picked up or finished — exactly the rows you're trying to read
+  are the ones that move. Alphabetical is stable while a dozen agents run.
+  Idle circles keep the recency sort (last output, human touch as floor), and
+  a circle still gets a touch the moment it finishes so freshly-done work
+  lands at the top of the idle band.
+
+- **`ctl` targets the pane you named.** Pane lookup resolved `slug == key ||
+  name == key` in one pass, so an *earlier* pane's display name shadowed a
+  *later* pane's slug — with two panes named `term-2` (the second being slug
+  `term-2-2`), `ctl send term-2` drove the wrong pane and silently skipped the
+  one asked for, injecting into its neighbour twice. Slug now wins over another
+  pane's name, and `scope` narrows the candidates *before* matching so a scoped
+  call disambiguates instead of erroring. "No such pane" is still distinct from
+  "outside your workspace". Regression test:
+  `slug_beats_another_panes_display_name`.
+
+- **A claude pane owns its conversation across daemon death.** Spawning a
+  claude pane now mints a UUID and passes `--session-id <uuid>`; the id is
+  persisted on the pane (`PersistedPane::claude_session`, serde-default so old
+  state files load) and carried through a graceful upgrade
+  (`HandoffPane::claude_session`). Restore relaunches with `--resume <uuid>`.
+  Before this, restore ran the bare persisted command, so a daemon crash
+  silently started a *fresh* conversation in every pane — on 2026-08-04 a
+  system OOM took the daemon down and all 49 panes came back empty (the
+  transcripts were fine; nothing pointed at them).
+  `--continue` is deliberately **not** the restore path: it resumes the most
+  recent conversation *in the cwd*, so the 42 panes sharing `~/work/vita` would
+  every one of them have landed on the same conversation. `resume_on_restore`
+  stays as the fallback for panes persisted without an id.
+  A pane created but never prompted has no transcript, and `--resume` on a
+  missing id exits non-zero (which closes the pane) — that case re-asserts
+  `--session-id` instead, so the pane keeps its identity either way. A command
+  that already carries an explicit `--resume`/`--session-id` is adopted as-is
+  rather than re-minted.
+
+## [0.14.1] — 2026-08-02
+
+Remove one PR ref and have it stay removed; cycle in the order you see.
+
+### Added
+
+- **Remove a single PR ref, both GUIs.** Hover a row in the chip popover or
+  the PR board and a **✕** drops just that reference — no more clearing the
+  whole circle to be rid of one stale link.
+- **Removal is sticky.** A TUI repaint re-emits the same bytes, so a plain
+  removal used to undo itself within seconds: the daemon now keeps a
+  per-workspace **dismissed set** (cap 32, oldest evicted) that blocks the
+  re-scrape at its single choke point. It persists across daemon restart and
+  `seance upgrade` handoff, carries through rename, and drops with the
+  workspace. A new *distinct* URL is still tracked, `seance ctl pr-link add`
+  un-dismisses, and both single-URL and clear-all `pr-link clear` dismiss
+  what they remove.
+
+### Fixed
+
+- **`ctrl+page` cycles the order you're looking at.** 0.14.0 rotated a ring
+  in workspace *creation* order, so "next" landed somewhere visually random.
+  Cycling now walks the **displayed sidebar order**, frozen for the duration
+  of a 2-second keypress burst so a mid-burst resort can't reshuffle the
+  rotation under your fingers. Both GUIs.
+
+## [0.14.0] — 2026-08-02
+
+The PR board: every circle's open PRs in one sweep, needs first.
+
+### Added
+
+- **PR board, both GUIs.** A `PRs (N)` button in the sidebar — visible only
+  when something is open — opens a full-content overlay that sweeps every PR
+  link the daemon knows, **circle first**: one section per circle, circles
+  that need you first, and inside each the same order. A row is `repo#N` plus
+  draft / CI / review glyphs, its age, the last review or comment, and a
+  **push or close** mark once it's been quiet four days. Merged and closed PRs
+  stay in the list but read muted; a header counts open / draft / done. The
+  same PR pinned by two circles is a mistake, not a duplicate to hide, so it's
+  annotated *also in <circle>* in both places. Click a row to open the PR,
+  a section header to select that circle; escape or a backdrop click closes.
+- **Structured PR state on the wire.** `PrStatus` gains `is_draft`,
+  `ci` (`pass` / `fail` / `running`), `review` (`required` / `approved` /
+  `changes`), and `opened_ms` / `last_review_ms` / `last_comment_ms` — so the
+  board can sort and age PRs instead of reprinting one label string. All
+  fields are `#[serde(default)]`: a 0.13-shaped `pr_watch.json` still parses,
+  and the vita `gh` poller now supplies them.
+
+### Changed
+
+- **A PR verdict *change* bumps the circle's recency clock**, so a PR going
+  red (or green) floats its circle the way pane activity does. Transitions
+  only — identical re-polls and the neutral backfill at boot never reshuffle
+  the sidebar under you.
+- **Chip and popover lead with the repo name** (`repo#12`), not a bare `#12`.
+  The `org/` prefix appears only when the links in view span more than one
+  org — the common single-org case stays short.
+
+## [0.13.0] — 2026-08-01
+
+PR links: the pull request you're waiting on becomes a circle that asks for you.
+
+### Added
+
+- **PR links are scraped, not configured.** The daemon reads every byte of
+  pane output already, so `gh pr create` (or a paste, or an agent echoing a
+  URL) is enough: GitHub PR URLs are pulled out of the raw PTY stream —
+  ANSI stripped, safe across chunk boundaries — and attributed to that pane's
+  workspace, most recent last, capped at 8 per circle. The list persists
+  across daemon restart *and* `seance upgrade` handoff.
+- **A watcher seam maps PR state onto attention.** An external poller owns
+  the judgment and writes `<state-dir>/pr_watch.json`
+  (`{url: {state, attention, label, updated_ms}}`, atomic); the daemon
+  mtime-polls it every 2s and merges verdicts onto links it already scraped —
+  it never decides anything itself. Vita's `gh` loop (every ~3min) is the
+  reference watcher. `needs` (changes requested, CI failing, new comment)
+  lights the circle exactly like an agent asking for help, so a **parked**
+  circle with a red PR resurfaces via the parked dot; approved + green reads
+  as `done`. Pane-needs still outranks it: pane-needs > working > pr-needs >
+  sticky / pr-done.
+- **Header chip, both GUIs.** The selected circle's most recent PR renders as
+  `#N` + the poller's label, colored by verdict; click opens the PR in a
+  browser, the caret (or right-click) opens a popover listing every link plus
+  *clear PR links*.
+- **`seance ctl pr-link add WS URL` / `pr-link clear WS [URL]`** — seed a link
+  by hand (backfill, or a PR nobody printed in a pane) or drop one/all.
+  Cap-checked as `pr_link_add` / `pr_link_clear`.
+
+### Changed
+
+- **Wire addition (additive, not breaking):** `WorkspaceMeta` gains
+  `pr_links: Vec<PrLink>` (`{url, status?, seen_ms}`, `PrStatus` =
+  `{state, attention?, label, updated_ms}`). The field is `#[serde(default)]`,
+  so a 0.12-shaped payload still parses — version lockstep on hello applies as
+  always, but nothing in the old wire changed meaning.
+- **Ctrl+page cycles a stable ring.** Cycling now walks `workspace_order`
+  instead of the recency sort, so the next circle doesn't move under you while
+  panes chatter.
+- **Workspaces that lose their last pane are pruned**, unless they were
+  created explicitly (`extra_workspaces` are exempt). No more empty circles
+  accumulating behind a killed agent.
+
+## [0.12.0] — 2026-08-01
+
+Subscriptions replace ownership: a circle can be live in every window at once.
+
+### Changed
+
+- **Workspace ownership is gone.** A workspace was exclusively owned by one
+  GUI window; to see it elsewhere you had to *pull* it away from wherever it
+  was. Now each connection carries its own subscription set, so the same
+  circle renders on the desktop, the laptop and the browser simultaneously —
+  no tug-of-war, no "elsewhere" limbo.
+- **Both sidebars split active / parked.** Active = what this window
+  subscribes to, rendered exactly as before; everything else collapses into
+  one **parked (N)** accordion below with the same sort and attention badges.
+  Selecting a parked row subscribes it; row menus gain *park* and *add to
+  active*; ctrl+page cycles the active list only. Panes spawned by `ctl` land
+  parked and badge **needs** until you first select them.
+- The active set persists per client and is replayed on attach — native
+  `~/.config/seance/subscriptions.json` (`{active, seen}`, atomic, shared with
+  the reconnect supervisor), web `localStorage["seance_active"]`. No stored
+  set = subscribe everything, so existing installs come up unchanged.
+- Grid fan-out is now per subscriber: 16ms for a subscriber's selected
+  workspace, 66ms for subscribed-but-not-selected (and overview), nothing for
+  a workspace nobody watches — the minimum across connections wins, and a
+  full grid goes out whenever any interested window doesn't have it selected.
+- Recording is independent of watching: the recorder taps ahead of fan-out,
+  so a zero-subscriber pane still records to the 48h ring.
+
+### Breaking
+
+- **Wire change** (all clients must match, as usual): `GuiRequest::Subscribe`
+  / `Unsubscribe` replace `TransferWorkspace` / `CollectAll`, which are
+  deleted. `GuiEvent::State` is now global (panes, statuses, asks, order for
+  every workspace) plus a `subscriptions` field; `foreign_workspaces` is
+  gone. `Attach` carries `subscriptions: Option<Vec<String>>` — `None`
+  subscribes to everything (migration path), `Some([])` is an empty window.
+  `Engine::flush_all_grids` retired.
+
+## [0.11.2] — 2026-08-01
+
+### Added
+
+- **✦ GUI census** (both GUIs): click the brand ✦ for a popover listing every
+  connected GUI window with a remote **kill** (`CloseWindow` → `Kicked`; the
+  kicked client stops reconnecting and says who closed it), plus version and
+  grimoire shortcuts. The buried-tab problem dies here.
+- `docs/design/SUBSCRIPTIONS.md` — the ownership→subscriptions design
+  (active/parked, multiplayer, PR links) awaiting a decision pass.
+
+### Changed
+
+- Sidebar sort matches the displayed clock: working band ordered by
+  when-work-started (stable, newest first); idle band by last output.
+  Web "elsewhere" rows show the activity time instead of the (identical)
+  host-window label.
+
+## [0.11.1] — 2026-08-01
+
+### Fixed
+
+- **Workspace activity clocks are daemon-owned** — time-since-output labels
+  and auto-sort recency now survive GUI relaunch, workspace pulls, `seance
+  upgrade` (handoff) and cold daemon restarts (state.json). Stamps originate
+  in the recorder (the one place that knows "real content change at unchanged
+  dims"), throttled to one note per pane per 5s; `State` carries
+  `workspace_meta`, live updates ride a new `Activity` event. Attach / pull /
+  relaunch / resize reflows no longer reset any clock.
+- **The jump-focus class**: every chrome navigation (ctrl+shift+j palette,
+  tile clicks, workspace switches, palette close) now arms `pending_focus` as
+  a render-time backstop — no more "jumped but can't type until I click".
+- Banishing the ACTIVE workspace selects the neighbor below (above when last)
+  in sidebar order, both GUIs.
+- Ctrl+page cycling reveals the newly selected workspace in the sidebar
+  (native `scroll_to_item`; web `scrollIntoView`) instead of leaving it
+  scrolled out of view.
+
+## [0.11.0] — 2026-07-31
+
+The web era: seance from anywhere, and sessions you can share.
+
+### Added
+
+- **Web client** (`seance web`): a wasm thin client speaking the daemon's GUI
+  protocol over a websocket bridge (token-auth'd, tailscale-transport policy).
+  WebGL2 glyph-atlas terminal renderer (paint p95 0.4ms), native chrome parity
+  (auto-sorted workspace rail, quicklaunch, accounts strip, context menus,
+  keymap with `alt+` twins, grimoire, activity drawer), pull-workspace from
+  the sidebar. `crates/seance-core` carve: the sans-io wire protocol, SCG3
+  codec, and input encoding shared by every client. `docs/WEB.md`.
+- **Session replay** (`docs/REPLAY.md`): an always-on 48h ring recorder in the
+  daemon (output-driven; keyframes before every human prompt), a player that
+  treats the timeline as ACTIVITY (idle collapses to a beat, typing plays at
+  real cadence; recorded-resolution letterboxed panes; prompts rail +
+  Previous/Next fly-to; `#t=` deep links), a web trim/publish editor shared by
+  all GUIs (workspace right-click → *share replay…*), `seance replay`
+  export/list/edit CLI, and an arms-length publisher seam
+  (`~/.config/seance/publish.json`; bundles are self-contained static sites
+  by default).
+
+### Changed
+
+- Echo latency on the web path: p50 51.5ms → 9.1ms (bridge 2ms poll +
+  typing-hot immediate paint; the daemon already bypassed its throttle).
+- Sidebar shows time-since-last-output instead of pane counts; banish × is
+  hover-only; summon focuses the terminal immediately (rename moved to
+  double-click); quicklaunch strip renamed "vita quicklaunch"; notes-flip
+  keeps editor focus on click (native).
+
+### Fixed
+
+- Bridge no-cache on `.wasm`/`.css` (stale-module ABI breaks).
+- Replay export resolves workspaces of exited panes from the ring's own
+  `Spawned` events — sharing after the work is done is the normal case.
+
+## [0.10.9] — 2026-07-30
+
+### Fixed
+
+- **Pagers work in panes again** (`git log` paged instead of dumping). The
+  daemon inherits the environment of whoever (re)started it — an agent
+  session running `seance upgrade` leaked its non-interactive overrides
+  (`PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, …) into every spawned pane. Pane
+  PTYs now scrub agent-ish env (PAGER/GIT_PAGER/SYSTEMD_PAGER/
+  GIT_TERMINAL_PROMPT/CI/DEBIAN_FRONTEND/NO_COLOR) at spawn — panes are
+  human terminals by definition.
+
+## [0.10.8] — 2026-07-30
+
+### Fixed
+
+- **Typing lag, part 5 (the big one): every frame cost 66ms because the
+  chrome fonts didn't exist.** gpui-component's stock theme requests
+  `.SystemUIFont` (a macOS pseudo-family that never resolves on Linux) and a
+  Linux mono default (`DejaVu Sans Mono`) that isn't installed here. gpui
+  caches the failed lookup but re-materializes the error object on every hit
+  — and with `RUST_BACKTRACE=1` (which the GUI sets for crash logs) each hit
+  captures a fresh backtrace, thousands of times per frame inside taffy text
+  measurement. Stack-sampling showed ~90% of `Window::draw` inside
+  `TextSystem::font_id`. Theme init now picks the first actually-installed
+  family (sans: Liberation Sans → Noto Sans → …; mono: JetBrainsMono Nerd
+  Font → …) via `all_font_names()`. **Window::draw p50 66.3ms → 3.7ms.**
+
+### Added
+
+- `[seance lat] gpui draw` gauge (gpui frame tracing drained every 5s) and
+  `gui render→paint` — the probes that located the frame cost.
+
+## [0.10.7] — 2026-07-30
+
+### Fixed
+
+- **Typing lag, part 4 (the GUI half): grid frames now actually schedule a
+  window frame.** In this gpui build a pane-entity `notify` never produced a
+  frame — the window only repainted on the 240ms sidebar-spinner tick, so a
+  keystroke's echo (or any grid update) sat applied-but-unpainted until the
+  next tick. Measured: `apply→paint` p50 ~68ms / p95 ~80ms, `render gap`
+  pinned at 233–250ms, real-typing `key→paint` p50 90ms / p95 271ms. (The
+  0.10.4 spinner slowdown 80ms→240ms silently made this worse — the spinner
+  was the app's only frame clock.) The daemon-event batch loop now kicks a
+  root notify per applied **visible** grid batch: immediately while a human
+  keystroke is in flight (~250ms typing-hot window), throttled to ~30fps for
+  plain streams, with a 33ms deferred kick so burst tails never wait for the
+  spinner. Root notify → render measured at p50 2.9ms / p95 15.3ms.
+- **Bridge events apply in batches — one render cycle per batch.** The old
+  loop did one `update` per daemon event, interleaving render work between
+  events; a keystroke's echo could queue behind a grid backlog (measured
+  bridge→apply p95 198ms). One `update` now drains everything queued
+  (cap 512), then decides on a single frame kick.
+
+### Added
+
+- More `[seance lat]` gauges: `gui bridge age`, `gui grid apply`,
+  `gui render gap`, `gui paint replay` / `gui paint fresh`,
+  `gui apply→paint`, `gui kick→render`.
+
+## [0.10.6] — 2026-07-30
+
+### Fixed
+
+- **Typing lag, part 3: the daemon's PTY I/O loop was the latency floor —
+  now event-driven.** Every PTY session thread ran a `sleep(8ms)` poll loop:
+  a keystroke waited up to 8ms just to be *written* to the PTY, and its echo
+  waited up to another 8ms to be *read* back — measured keystroke→grid-push
+  p50 11.7ms / p95 15.8ms inside the daemon, before the GUI ever saw a frame.
+  The loop now blocks in `poll(2)` on the PTY master + a self-pipe that every
+  write enqueue pokes. Measured after: **p50 0.3ms / p95 0.4ms** idle, and
+  **p50 0.4ms / p95 0.7ms / max 3.4ms** while three panes flooded full-rate
+  output (engine-mutex wait stayed ≤0.7ms — no contention). Side effect: 22
+  session threads no longer wake 125×/s each while idle.
+- **Keystroke echo frames bypass the 16ms selected-workspace grid throttle.**
+  A human `Input` clears the pane's last-push stamp, so the echo's Wakeup
+  pushes immediately instead of riding the coalescing timer. Bounded by
+  typing rate — output storms still throttle exactly as before.
+
+### Added
+
+- **Always-on typing-latency probes** (`src/latency_probe.rs`), reported as
+  5s aggregates tagged `[seance lat]`: daemon `input lockwait` / `input
+  handle` / `input→gridpush` (daemon stderr → daemon-upgrade.log), GUI
+  `key→grid-apply` / `key→paint` (gui.stderr.log). Per-session-event pump
+  probes are additionally gated behind `SEANCE_DEBUG_RENDER=1` (storms drive
+  that loop at 100k+ events/s).
+
+## [0.10.5] — 2026-07-30
+
+### Fixed
+
+- **Typing lag, part 2: 9× cheaper grid reshapes.** gpui's line cache only
+  spans two consecutive frames, and grid repaints are spaced by the replay
+  path — so every live-pane repaint cold-shaped all visible text (~14ms per
+  pane; several busy claude panes saturated the UI thread). Shaped runs now
+  live in a durable content-addressed cache (text+style+metrics → ShapedLine,
+  shared across panes): a spinner tick re-shapes only the changed run
+  (reshape avg 14.4ms → 1.6ms). Paint accounting added to
+  `SEANCE_DEBUG_RENDER=1` (`paint-probe`: replays/reshapes/avg).
+
+## [0.10.4] — 2026-07-30
+
+### Fixed
+
+- **Typing lag on many-workspace sessions** — the sidebar working-spinner
+  animated at 80ms, and each animation tick re-renders the entire window
+  (~55ms/frame at 24 circles), saturating the UI thread so keystroke frames
+  queued behind it. Spinner now ticks at 240ms (~85% → ~20-50% CPU). New
+  `SEANCE_DEBUG_RENDER=1` prints a renders/s probe to the gui log. The
+  underlying frame cost at high workspace counts is tracked separately.
+
+## [0.10.3] — 2026-07-30
+
+### Added
+
+- **cmd+c / cmd+v in terminals on macOS** — native copy/paste chords work
+  alongside ctrl+shift+c/v (cmd never reaches the PTY, so nothing is stolen
+  from TUIs).
+
+## [0.10.2] — 2026-07-30
+
+### Fixed
+
+- **Quicklaunch from a thin client spawns correctly** — the chip click was
+  expanding `~` in the entry's cwd on the CLIENT machine before sending, so a
+  mac client sent `/Users/...` to a linux daemon and the spawn died silently.
+  cwd now travels raw and expands daemon-side (which the engine already did).
+- **Spawns with a missing cwd fall back to `~`** (loudly, in the daemon log)
+  instead of failing as a dead click; the GUI also logs daemon-rejected
+  requests to `gui.stderr.log`.
+
+## [0.10.1] — 2026-07-30
+
+### Fixed
+
+- **Terminal font fallbacks** — the hardcoded `JetBrainsMono Nerd Font` now
+  falls back to Menlo / JetBrains Mono / DejaVu Sans Mono / monospace when
+  not installed (fresh thin-client machines rendered with a garbage
+  substitute). Install the Nerd Font for the identical-to-desk look.
+
+## [0.10.0] — 2026-07-30
+
+### Added
+
+- **Thin-client / remote mode** (docs/REMOTE.md) — run the GUI on one machine
+  (including macOS) against a daemon on another, over a supervised
+  ssh-forwarded unix socket. VNC-substitute intent: identical experience on
+  both ends.
+  - **Launch picker**: with no daemon reachable, choose "connect to remote
+    host" (type an ssh destination) or "run locally"; the choice persists at
+    `~/.config/seance/launch.json` and prefills next launch. CLI overrides:
+    `seance --remote <host>` / `seance --local`.
+  - **Tunnel supervisor**: seance spawns and supervises the
+    `ssh -N -L` forward (BatchMode, keepalives, respawn with backoff),
+    auto-starts the remote daemon (`seance _ensure-daemon` over ssh), and
+    tears the tunnel down with the GUI (quit hook; PDEATHSIG on Linux).
+    Auth failures print a copy-pasteable `autossh` stopgap.
+  - **Strict version handshake**: the daemon refuses `ctl`/`gui` clients whose
+    build doesn't exactly match — cross-machine skew fails loudly instead of
+    corrupting the protocol (`handoff`/`upgrade` roles exempt).
+  - **Everything from the daemon** (fs bridge): file panes (content, watch,
+    snapshot history), scratchpads, the shared layout (all windows now share
+    tiling via the daemon state dir), host widget chips (polled + selected
+    daemon-side, pushed to every window), and GUI event-log writes (human UI
+    actions land in the daemon's flight recorder). No GUI-side workspace IO
+    remains; bridge ops run off the input path on both ends.
+  - **macOS support**: portable uid/socket paths, `open` vs `xdg-open`,
+    `ps` vs `/proc`; the pinned gpui revs build clean on darwin.
+  - `SEANCE_SOCKET` targets any `seance ctl` at a forwarded socket; the
+    daemon always binds its own local path (`bind_socket_path`).
+
+### Fixed
+
+- **Focus after new workspace / summon** — finishing the workspace-name
+  rename on an empty circle no longer leaves keyboard focus dead (chords
+  like `ctrl+shift+n` and typing did nothing until a click). Focus returns
+  to the active pane when one exists, otherwise the app root so capture
+  hotkeys keep working; after a summoned pane is named, keys land in the
+  terminal without an extra click.
+
+## [0.9.23] — 2026-07-29
+
+### Added
+
+- **`ctrl+shift+r` renames the selected workspace** — focuses the sidebar
+  inline rename field; Enter commits and returns keyboard focus to the pane
+  that was active (Escape cancels the same way).
+- **Durable GUI stderr log** at `~/.local/share/seance/gui.stderr.log` (or
+  `$SEANCE_STATE_DIR/`). Desktop launches no longer swallow panics — stderr is
+  redirected on GUI start, `RUST_BACKTRACE=1` is set when unset, and the file
+  rotates to `gui.stderr.log.1` above ~5 MiB.
+
+### Changed
+
+- **Working circles show a left-icon spinner** instead of a `"working"` text
+  badge, so more of the workspace name is visible. `needs` / `done` badges
+  are unchanged.
+
+### Fixed
+
+- **`ctrl+shift+w` kills the active pane only** — no longer banishes the whole
+  workspace on the first press. The workspace is removed only when that was
+  its last pane (or the selected circle is already empty).
+- **Terminal copy no longer kills the GUI on Wayland** — `ctrl+shift+c` (and
+  mouse-up auto-copy) prefer `wl-copy` so clipboard ownership lives out of
+  process; GPUI's in-process write is only a fallback. Caps selection size,
+  catch_unwind around notifications, logs copy outcome to `gui.stderr.log`.
+
+## [0.9.22] — 2026-07-22
+
+### Changed
+
+- **Workspace sidebar auto-sorts; drag-reorder removed.** Circles with an
+  actively working agent (title spinner / agent status) float to the top;
+  otherwise order is last human touch — typing into any terminal in that
+  circle, or right-click header → **touch**. Selecting a workspace alone
+  does not reorder. Pane drag between circles is unchanged.
+- **Claude account strip is collapsed by default** — only the current account
+  shows. Click it (or the section title) to expand the full list; click
+  another account to switch and collapse. Clicking the already-selected
+  account is a no-op.
+- **Finishing work bumps sidebar recency** — when a circle stops having any
+  live-working agent (status or title spinner), it is touched so it sits at
+  the top of the non-working band.
+- **GUI relaunch restores last selected workspace** — after `restart-gui` /
+  last-window close, the sole reattaching window selects the prior circle
+  (and focused pane) instead of jumping to the first in order.
+
+## [0.9.21] — 2026-07-22
+
+### Fixed
+
+- **Quicklaunch selects its new workspace.** GUI-requested spawns now update
+  the requesting window's selection daemon-side before the State push — the
+  push used to carry the old selection and revert the GUI's switch (invisible
+  for same-workspace summons, visible for quicklaunch's fresh workspaces).
+
+## [0.9.20] — 2026-07-22
+
+### Fixed
+
+- **Quicklaunch modal inputs are clickable** — mouse events were falling
+  through the overlay to the terminal underneath, which stole focus on
+  mouse-down (`.occlude()` on the overlay). Same fix applied to the overview
+  root, where dead-space clicks silently focused hidden panes.
+
+### Changed
+
+- **Quicklaunch always opens a fresh workspace** named after the entry
+  (uniquified: vita, vita-2, …) with a single pane and no rename prompt.
+  The `workspace` config field and modal input are gone; a legacy
+  `"workspace"` key in the JSON still parses and is ignored.
+
+## [0.9.19] — 2026-07-22
+
+### Added
+
+- **Quicklaunch management UI** — the strip is now editable in place:
+  right-click a chip for **edit… / remove**, **drag-drop** chips to reorder
+  (insert-before, same as sidebar rows), and a **`+`** button on the title
+  row opens a modal editor (name / cwd / command / workspace; Enter saves,
+  Esc cancels; empty or colliding names block the save with a hint). All
+  changes persist atomically to `~/.config/seance/quicklaunch.json` — the
+  file stays the source of truth and hand-edits still hot-reload. Caveat:
+  unknown JSON fields don't survive a UI edit (serde round-trip).
+
+## [0.9.18] — 2026-07-22
+
+### Added
+
+- **Quicklaunch strip** in the sidebar (above the claude-accounts host
+  strip): configurable one-click buttons that spawn a terminal in a chosen
+  working dir running a chosen command. Config at
+  `~/.config/seance/quicklaunch.json`:
+  `[{"name": "vita", "cwd": "~/work/vita", "command": "claude"}]` —
+  `command` omitted = plain shell; optional `"workspace"` targets/creates a
+  workspace (default: selected). Hot-reloads on file edit (~2s mtime watch);
+  a bad edit keeps the previous entries. Hidden when the file is
+  missing/empty.
+
+## [0.9.17] — 2026-07-22
+
+### Changed
+
+- Overview cards get a **hover effect** (lifted bg + warm border) so it's
+  obvious they're click-to-select.
+
+## [0.9.16] — 2026-07-22
+
+### Fixed
+
+- **Overview no longer shows blank cards** for workspaces you haven't visited
+  since GUI start. The GUI's CPU guard (drop grid frames for non-selected
+  workspaces) was also eating the daemon's overview open-flush; the guard now
+  stands down while overview is open. This regression was fixed once before
+  in an app.rs working tree that got rolled back — re-fixed at the guard
+  itself with a comment explaining the interplay. Workaround was
+  select-workspace + resize; no longer needed.
+
+## [0.9.15] — 2026-07-22
+
+Multi-window completion + overview that actually fills the screen.
+
+### Changed
+
+- **Overview (`ctrl+shift+space`) fills the viewport**: workspace cards split
+  the window into an equal grid (spacer-padded rows, equal card widths); pane
+  thumbnails letterbox up to but never above **1× native resolution**. No more
+  postage stamps huddled in the corner.
+- Grid damage-decode failure now repairs with a **targeted per-pane FULL
+  frame** (`refresh_grid`) instead of re-attaching the whole window.
+
+### Added
+
+- New remote panes request their first FULL frame on mount — workspaces
+  arriving via **transfer / pull / collect** paint immediately instead of
+  waiting for the daemon's delayed flush.
+- **Empty second window** shows pull instructions on the stage (right-click
+  sidebar to pull / send from another window) instead of the summon hint.
+- **Drive-mode chip** in the pane header when a pane isn't in default pair
+  mode: `⛔ locked` (agents can't inject) / `⚡ led` (agent drives).
+
+### Removed
+
+- `Engine::full_state_event` (superseded by per-window state) — the last of
+  the "protocol-ready, awaiting UI wiring" allows is gone; every multi-window
+  API is now wired (`refresh_grid`, `flush_all_grids` via CollectAll,
+  `empty_window` read-side).
+
+## [0.9.14] — 2026-07-22
+
+Codebase-health release: the full modular refactor the 0.9.13 handoff called
+for, plus dead-subsystem removal, zero warnings, and a hard test/format gate.
+No protocol break; live smoke = daemon upgrade + GUI restart with 9 panes
+surviving. Adversarially reviewed as behavior-preserving (all moved bodies
+diffed against baseline; state files load identically).
+
+### Changed
+
+- Split oversized modules for maintainability (no protocol break):
+  - `app.rs` (5.9k LOC) → `app/{mod,actions,layout,util,chrome,pads,overview,sidebar,tiles,palette,workspaces}.rs` — core `app/mod.rs` now ~1.9k
+  - `runtime/engine` → `engine/{mod,gui,spawn,control,helpers,tests,gui_tests}.rs` — `mod.rs` now ~0.6k
+  - `ctl` → `ctl/{mod,parse,wait,print,phone}.rs`
+- Expanded unit/integration tests (~76 → **143**): hermetic engine
+  control-plane tests, **multi-window `handle_gui` tests** (attach/empty/
+  transfer/collect/overview/bye/prune against captured GuiEvent payloads),
+  layout.json parse round-trips, app pure-helper pins
+- Zero build warnings (was 89), enforced by `scripts/check.sh`
+  (fmt --check + deny-warnings check + tests)
+
+### Removed
+
+- Dead pre-daemon **local-PTY subsystem** (~1.4k LOC): `terminal.rs`,
+  `terminal_view.rs`, `PaneBody::Terminal` and pane vestige. Compiler-proven
+  unreachable — the live path is daemon PTYs (`pty_session` + `engine/spawn`)
+  rendered by `remote_term_view`. Shared items live on in `term_shared.rs`.
+- Dead in-GUI control-server cluster in `control.rs` (superseded by the
+  daemon's own ctl serving), retired whisper compose + run-in-pane launch bar
+  code, misc never-read fields/methods across the tree
+- Multi-window protocol APIs not yet wired to UI are kept and marked
+  (`refresh_grid`, `flush_all_grids`, `full_state_event`, `empty_window`)
+
+### Fixed
+
+- Restored multi-window **app UI** after accidental loss in refactor restore:
+  workspace context menu (send to new window / peer windows / collect all),
+  empty-sidebar right-click pull, same-process empty window, overview
+  (`ctrl+shift+space`), minimize shelf, touch, hover banish ×, activity-band
+  sidebar sort, title-spinner working badges
+- Double context menu on workspace rows (empty-area pull/collect menu no longer
+  nests on the scroller under circle menus)
+- Tile **row sashes** (vertical multi-row resize) + `row_weights` in layout.json
+- Whisper compose UI + run-in-pane launch bar removed from chrome (steer via
+  agent TUI / `ctl send` / notes flip)
+- Sidebar **working** badge uses *observed* TUI title spinners (Claude braille),
+  not sticky `status-set working` — stale inject/open-task no longer marks
+  idle circles; live agents without status-set now light up. Daemon also
+  forwards title-only OSC changes (was skipped when cells unchanged).
+
+### Added
+
+- Sidebar: inactive workspaces show **working** / **needs** / **done** when panes
+  are active or finished since last visit (collapsed circles stay scannable)
+- Tile **row sashes** (vertical split resize) + layout.json `row_weights`
+- **Minimize shelf** — only when the selected circle has shelved panes; chips
+  only (no label). Hidden entirely when nothing is minimized
+- Pane **right-click menu** — minimize, notes, rename, popout, move, banish
+- **Overview** (`ctrl+shift+space`) — full-window live map of every workspace
+  with scaled terminal grids (daemon streams non-selected circles while open)
+- **Multi-window** — a workspace lives in exactly one window. Right-click a
+  circle: send to new window / send to `name +N` / collect all here. Second
+  `seance` process opens an empty window (right-click empty sidebar to pull).
+
+### Removed
+
+- **Whisper** UI (💬 compose bar / mid-flight inject chrome) — steer via the
+  agent TUI, `ctl send`, or notes flip; ⚡ arm remains
+- **Run in pane** agent launch bar (claude/codex/grok chips) — reclaim chrome;
+  run profiles manually
+- Sidebar **pane rows** and workspace **manual drag-reorder**
+
+### Changed
+
+- Pane chrome design pass: owner accent rail, shorter titles, quieter action
+  cluster, higher inactive opacity (see `docs/DESIGN_PASS_2026-07-21.md`)
+- Workspace list **auto-sorts**: working → needs → done-unread → rest, each band
+  by activity recency (input / inject / status), not click-to-select or PTY paint
+
+### Fixed
+
+- Daemon upgrade handoff: stop closing/dup-racing the PTY master FD (idle shells
+  were SIGHUP'd while busy Claude panes often survived); wait on I/O release
+  flag; never respawn a fresh shell when SCM_RIGHTS adopt fails
+- Pane sash resize: use GPUI `on_drag` / `on_drag_move` so resize works over
+  markdown/file panes and across multi-row grids (was broken once the pointer
+  left the 5px divider onto a selectable viewer)
+- Notes flip: focus the notes editor after mount; re-steal if the terminal
+  face FocusHandle still holds keyboard (could not type in notes)
+- Host claude switcher: collapsed to active account only; click expands list
+  (height slide down/up), pick collapses again
+
+---
+
+## [0.9.13] — 2026-07-21
+
+### Added
+
+- Host sidebar bridge (`src/host.rs`, `docs/HOST.md`) — optional JSON-polled chips (e.g. claude accounts); fail-closed
+- Agent launch bar (claude / codex / grok → paste + enter into focused pane)
+- Capture-phase global hotkeys; workspace cycle (`ctrl+pageup/down`) and pane cycle (`ctrl+shift+pageup/down`)
+- Remember last focused pane per workspace; restore on circle switch
+- Invariant: selected workspace with panes always has an active pane
+- Terminal drag-select + copy toast; paste via inject path
+- `ctrl+shift+w` banish (kill) active pane
+- File-pane guidance in `ctl skill` / help (`new --file` vs bat/watch loops)
+
+### Changed
+
+- Process exit **auto-closes** the pane (no tombstone chrome); handoff/restore drop legacy exited panes
+- Workspace switch forces FULL grid flush + local rev-gate open (fewer blank panes)
+- Damage decode failures rate-limit reattach and clear rev when resyncing
+- Sidebar selected-row fill shared for workspaces / panes / host chips
+
+### Docs
+
+- `docs/HOST.md`; orchestration/daemon process-exit semantics; README hotkeys + screenshot
+
+---
+
+## [0.9.12] — 2026-07-20
+
+### Changed
+
+- `ctl phone`: open telegram topic only (**no** `register_participant` claim); seed a **stage card** (workspace, roster, ctl how-to)
+- Bound topic still receives optional needs-human one-liners
+
+### Removed
+
+- `export-session` HTML scrubber (half-measure); full continuous grid replay remains a filed epic, not this
+
+---
+
+## [0.9.11] — 2026-07-20
+
+### Added
+
+- Weighted multi-pane sashes (`n≥2`) with `layout.json` persist
+- Pad drawer live-refresh; phone off UI thread + open telegram link
+- Cmdlog serde + handoff/cold persist; gated shell cmd-end → idle
+- Export v1 decision-timeline HTML (later removed in 0.9.12)
+- `e2e-thorough.sh`, `upgrade-load-test.sh`
+
+---
+
+## [0.9.10] — 2026-07-20
+
+### Added
+
+- Pad drawer (stage chip / ▤): task inject body + scratchpad tail + phone status
+- Pane chrome ☎ (`ctl phone`) and ▤ (pad drawer)
+
+---
+
+## [0.9.9] — 2026-07-20
+
+### Fixed
+
+- Flaky `seance upgrade` EAGAIN: blocking socket, longer timeout, flush+half-close, concurrent-upgrade gate
+- FULL grids on GUI Attach; damage-decode resync without blanking when rate-limited
+- FULL frames clear hyperlinks authoritatively
+
+---
+
+## [0.9.8] — 2026-07-19
+
+### Added
+
+- Stage strip (urgency-sorted roster chips); desktop notify on needs-human / ask
+- Precanned prompts (`ctrl+shift+k`), fuzzy jump (`j`), focus-zoom (`z`), 2-pane sash
+- OSC-8 / URL open; last-failed command (`f`)
+- Event-driven `wait` wake; profile boot-clear after `--wait-ready`
+- `ctl phone` (vita telegram topic); prompts library
+- `seance --version` no longer launches the GUI
+
+---
+
+## [0.9.7] — 2026-07-19
+
+### Added
+
+- `wait --cat` / `--harvest` and `ctl harvest` (fan-in done + pad bodies)
+- Task sidecars (`.taskid` / `.task.json`) next to scratchpad on inject
+- Skill rewrite for worker/orch hot path; roster prefers slug; `task=` on roster
+
+---
+
+## [0.9.6] — 2026-07-19
+
+### Added
+
+- Task envelopes: `task_id` on send, durable inject inbox (`ctl task`), `finish --task`
+- Evidence-bound `wait --status done` (pad growth since inject; `--badge-only` escape)
+- Inject baselines persist on cold restart / handoff
+- In-seance orchestrator collab test (`scripts/agent-collab-test.sh`)
+
+### Changed
+
+- `status-set done` gated on evidence; process exit → idle; pad defaults to self
+
+---
+
+## [0.9.5] — 2026-07-18
+
+### Added
+
+- Orchestrator A+: co-presence, dense brief/wait/roster, `send --file`
+- `finish` / `note` with attributed atomic pads; `pad_rev` + since-inject wait
+- Lifecycle persist across handoff/disk; codex full-access profile
+- Multi-agent collab test harness + docs
+
+---
+
+## [0.9.0] — 2026-07-17
+
+### Added
+
+- Initial public release: multi-pane live terminals on a long-lived daemon
+- Flip-notes scratchpads, file panes, control plane (`ask` / `propose` / status / `ctl skill`)
+- Any agent CLI or shell as a first-class pane — not a single-vendor wrapper

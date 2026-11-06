@@ -1,0 +1,214 @@
+//! Split-ratio / pane-weight layout codec. Storage lives daemon-side (see
+//! `daemon::fsbridge` LayoutLoad/LayoutSave) so every window — local or thin
+//! client — shares the same tiling; this module is the pure parse/serialize.
+
+use std::collections::HashMap;
+
+pub(super) const DEFAULT_SIDEBAR_WIDTH: f32 = 232.;
+
+pub(super) fn clamp_sidebar_width(width: f32) -> f32 {
+    if width.is_finite() {
+        width.clamp(160., 520.)
+    } else {
+        DEFAULT_SIDEBAR_WIDTH
+    }
+}
+
+/// Defaults when the file is missing or unparseable.
+fn empty_layout() -> (f32, HashMap<String, f32>, HashMap<String, f32>, f32) {
+    (0.5, HashMap::new(), HashMap::new(), DEFAULT_SIDEBAR_WIDTH)
+}
+
+/// Missing fields preserve pre-resize layout compatibility.
+fn parse_layout_json(bytes: &str) -> (f32, HashMap<String, f32>, HashMap<String, f32>, f32) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(bytes) else {
+        return empty_layout();
+    };
+    let split = v.get("split_ratio").and_then(|x| x.as_f64()).unwrap_or(0.5) as f32;
+    let mut weights = HashMap::new();
+    if let Some(obj) = v.get("weights").and_then(|w| w.as_object()) {
+        for (k, val) in obj {
+            if let Some(f) = val.as_f64() {
+                weights.insert(k.clone(), f as f32);
+            }
+        }
+    }
+    let mut row_weights = HashMap::new();
+    if let Some(obj) = v.get("row_weights").and_then(|w| w.as_object()) {
+        for (k, val) in obj {
+            if let Some(f) = val.as_f64() {
+                row_weights.insert(k.clone(), f as f32);
+            }
+        }
+    }
+    let sidebar_width = v
+        .get("sidebar_width")
+        .and_then(|x| x.as_f64())
+        .map(|w| clamp_sidebar_width(w as f32))
+        .unwrap_or(DEFAULT_SIDEBAR_WIDTH);
+    (split.clamp(0.2, 0.8), weights, row_weights, sidebar_width)
+}
+
+fn serialize_layout_json(
+    split_ratio: f32,
+    weights: &HashMap<String, f32>,
+    row_weights: &HashMap<String, f32>,
+    sidebar_width: f32,
+) -> String {
+    let mut wmap = serde_json::Map::new();
+    for (k, v) in weights {
+        wmap.insert(k.clone(), serde_json::json!(*v));
+    }
+    let mut rmap = serde_json::Map::new();
+    for (k, v) in row_weights {
+        rmap.insert(k.clone(), serde_json::json!(*v));
+    }
+    let v = serde_json::json!({
+        "split_ratio": split_ratio,
+        "weights": wmap,
+        "row_weights": rmap,
+        "sidebar_width": clamp_sidebar_width(sidebar_width),
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_default()
+}
+
+/// Decode daemon-provided layout JSON ("" / malformed → defaults).
+pub(super) fn load_layout_json(
+    bytes: &str,
+) -> (f32, HashMap<String, f32>, HashMap<String, f32>, f32) {
+    if bytes.is_empty() {
+        return empty_layout();
+    }
+    parse_layout_json(bytes)
+}
+
+pub(super) fn spawn_layout_writer(
+    client: std::sync::Arc<crate::gui_client::GuiClient>,
+) -> std::sync::mpsc::Sender<String> {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::Builder::new()
+        .name("seance-layout-push".into())
+        .spawn(move || {
+            while let Ok(mut json) = rx.recv() {
+                // Serial writes keep an earlier drag from overwriting a later one.
+                while let Ok(next) = rx.try_recv() {
+                    json = next;
+                }
+                if let Err(e) = client.layout_save(&json) {
+                    eprintln!("[seance] layout save failed: {e:#}");
+                }
+            }
+        })
+        .expect("spawn layout writer");
+    tx
+}
+
+pub(super) fn save_layout_daemon(
+    writer: &std::sync::mpsc::Sender<String>,
+    split_ratio: f32,
+    weights: &HashMap<String, f32>,
+    row_weights: &HashMap<String, f32>,
+    sidebar_width: f32,
+) {
+    let s = serialize_layout_json(split_ratio, weights, row_weights, sidebar_width);
+    if s.is_empty() {
+        return;
+    }
+    if let Err(e) = writer.send(s) {
+        eprintln!("[seance] layout save failed: {e:#}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_full_round_trips_through_serialize() {
+        let mut weights = HashMap::new();
+        weights.insert("cadence".to_string(), 0.7_f32);
+        weights.insert("lab".to_string(), 0.3_f32);
+        let mut row_weights = HashMap::new();
+        row_weights.insert("main".to_string(), 1.5_f32);
+
+        let text = serialize_layout_json(0.42, &weights, &row_weights, 360.);
+        let (split, w, rw, sidebar) = parse_layout_json(&text);
+
+        assert!((split - 0.42).abs() < 1e-6);
+        assert_eq!(sidebar, 360.);
+        assert_eq!(w.len(), 2);
+        assert!((w["cadence"] - 0.7).abs() < 1e-6);
+        assert!((w["lab"] - 0.3).abs() < 1e-6);
+        assert_eq!(rw.len(), 1);
+        assert!((rw["main"] - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_malformed_json_falls_back_to_defaults() {
+        let (split, w, rw, sidebar) = parse_layout_json("{ this is not json ");
+        assert!((split - 0.5).abs() < 1e-6);
+        assert_eq!(sidebar, DEFAULT_SIDEBAR_WIDTH);
+        assert!(w.is_empty());
+        assert!(rw.is_empty());
+    }
+
+    #[test]
+    fn parse_non_object_json_falls_back_to_defaults() {
+        // Valid JSON but not an object (array / scalar) → defaults.
+        let (split, w, rw, sidebar) = parse_layout_json("[1, 2, 3]");
+        assert!((split - 0.5).abs() < 1e-6);
+        assert_eq!(sidebar, DEFAULT_SIDEBAR_WIDTH);
+        assert!(w.is_empty());
+        assert!(rw.is_empty());
+    }
+
+    #[test]
+    fn parse_missing_fields_uses_defaults_per_field() {
+        // Object present but empty → default split, empty maps.
+        let (split, w, rw, sidebar) = parse_layout_json("{}");
+        assert!((split - 0.5).abs() < 1e-6);
+        assert_eq!(sidebar, DEFAULT_SIDEBAR_WIDTH);
+        assert!(w.is_empty());
+        assert!(rw.is_empty());
+
+        // Only split present.
+        let (split2, w2, rw2, sidebar) = parse_layout_json(r#"{"split_ratio": 0.6}"#);
+        assert!((split2 - 0.6).abs() < 1e-6);
+        assert_eq!(sidebar, DEFAULT_SIDEBAR_WIDTH);
+        assert!(w2.is_empty());
+        assert!(rw2.is_empty());
+    }
+
+    #[test]
+    fn parse_clamps_split_ratio() {
+        // Above range → clamped to 0.8.
+        let (hi, _, _, _) = parse_layout_json(r#"{"split_ratio": 0.99}"#);
+        assert!((hi - 0.8).abs() < 1e-6);
+        // Below range → clamped to 0.2.
+        let (lo, _, _, _) = parse_layout_json(r#"{"split_ratio": 0.05}"#);
+        assert!((lo - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_ignores_non_numeric_weight_values() {
+        // Non-f64 weight entries are silently skipped, numeric ones kept.
+        let text = r#"{"weights": {"a": 0.4, "b": "oops", "c": null}}"#;
+        let (_, w, _, _) = parse_layout_json(text);
+        assert_eq!(w.len(), 1);
+        assert!((w["a"] - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sidebar_width_rejects_invalid_values_and_clamps_saved_sizes() {
+        for (json, expected) in [
+            (r#"{"sidebar_width": 1}"#, 160.),
+            (r#"{"sidebar_width": 2000}"#, 520.),
+            (r#"{"sidebar_width": "wide"}"#, DEFAULT_SIDEBAR_WIDTH),
+            (r#"{"sidebar_width": null}"#, DEFAULT_SIDEBAR_WIDTH),
+        ] {
+            assert_eq!(load_layout_json(json).3, expected);
+        }
+        assert_eq!(clamp_sidebar_width(f32::NAN), DEFAULT_SIDEBAR_WIDTH);
+        assert_eq!(clamp_sidebar_width(f32::INFINITY), DEFAULT_SIDEBAR_WIDTH);
+    }
+}

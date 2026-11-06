@@ -1,0 +1,518 @@
+//! Small free helpers and drag-payload types for the SeanceApp view:
+//! grid decode, tooltips, selection/DnD hygiene, status colors, time, and the
+//! best-effort telegram status bridge.
+
+use gpui::{div, prelude::*, Context, Render, Window};
+use gpui_component::{GlobalState, WindowExt as _};
+
+use crate::runtime::snapshot::GridSnapshot;
+use crate::theme::SeancePalette;
+
+pub(super) fn decode_grid_b64(
+    data_b64: &str,
+    base: Option<&GridSnapshot>,
+) -> Result<GridSnapshot, String> {
+    use crate::runtime::snapshot::decode_grid_bin_onto;
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64)
+        .map_err(|e| e.to_string())?;
+    decode_grid_bin_onto(&bytes, base)
+}
+
+/// Payload for dragging a pane by its title strip onto another pane.
+#[derive(Clone)]
+pub(super) struct DraggedPane {
+    pub slug: String,
+}
+
+/// Payload for dragging a circle's rail row onto a space.
+#[derive(Clone)]
+pub(super) struct DraggedCircle {
+    pub slug: String,
+}
+
+/// Payload for dragging a space row to reorder the spaces.
+#[derive(Clone)]
+pub(super) struct DraggedSpace {
+    pub id: String,
+}
+
+/// Payload for dragging a quicklaunch chip (reorder chips, insert-before).
+#[derive(Clone)]
+pub(super) struct DraggedQuickLaunch {
+    pub name: String,
+}
+
+/// Tooltip helper: `.tooltip(tip("..."))` on any interactive element.
+pub(super) fn tip(
+    text: &'static str,
+) -> impl Fn(&mut Window, &mut gpui::App) -> gpui::AnyView + 'static {
+    move |window, cx| gpui_component::tooltip::Tooltip::new(text).build(window, cx)
+}
+
+/// Owned-string tooltip (host chip labels, errors, …).
+pub(super) fn tip_s(
+    text: impl Into<String>,
+) -> impl Fn(&mut Window, &mut gpui::App) -> gpui::AnyView + 'static {
+    let text = text.into();
+    move |window, cx| gpui_component::tooltip::Tooltip::new(text.clone()).build(window, cx)
+}
+
+/// Standard selected-row fill for sidebar lists (workspaces, host chips, panes).
+/// High-contrast on `bg_elevated` — not `surface` (too close to the panel).
+#[inline]
+/// Selected-row fill. Deliberately well clear of `bg_elevated()` (L10) — at
+/// the old `border()` (L19) the selected circle was hard to pick out of a long
+/// rail at a glance.
+pub(super) fn selected_row_fill() -> gpui::Hsla {
+    if crate::theme::active().id == seance_core::schemes::DEFAULT {
+        return gpui::hsla(345. / 360., 0.14, 0.28, 1.0);
+    }
+    // Other schemes: the border's hue, the same 9 points of lightness away
+    // from it as candlelit's (L19 -> L28), toward the text.
+    let b = SeancePalette::border();
+    let step = if crate::theme::is_light() {
+        -0.09
+    } else {
+        0.09
+    };
+    gpui::Hsla {
+        l: (b.l + step).clamp(0., 1.),
+        ..b
+    }
+}
+
+pub(super) fn ui_debug(msg: &str) {
+    if std::env::var("SEANCE_DEBUG_UI").is_ok() {
+        eprintln!("[seance:ui] {msg}");
+    }
+}
+
+/// Kill in-progress platform text selection (markdown file panes are
+/// `.selectable(true)`). Same fix as the face chip: sidebar drag-and-drop
+/// keeps the mouse button down while the cursor crosses the tile region, and
+/// without this the markdown body treats that as a text drag-select.
+///
+/// Cheap when idle: `has_text_selection` short-circuits. Never call this from
+/// `on_drag_move` — GPUI refreshes the whole window every drag move already,
+/// and clear/end walks every selectable TextView. Continuous kill was the
+/// sidebar DnD frame limiter.
+pub(super) fn kill_text_selection(window: &mut Window, cx: &mut gpui::App) {
+    if !window.has_text_selection(cx) {
+        return;
+    }
+    window.end_text_selection(cx);
+    window.clear_text_selection(cx);
+}
+
+/// Sidebar rows own their press/drag. Suppress window text selection for this
+/// mouse-down (Button/Input pattern) so a reorder never starts a markdown
+/// highlight — even before the drag threshold, and without per-move clears.
+pub(super) fn sidebar_press_no_select(window: &mut Window, cx: &mut gpui::App) {
+    GlobalState::suppress_text_selection(cx);
+    kill_text_selection(window, cx);
+}
+
+/// The little pill that follows the cursor during a drag.
+pub(super) struct DragPill {
+    pub(super) label: String,
+}
+
+impl Render for DragPill {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(SeancePalette::surface())
+            .border_1()
+            .border_color(SeancePalette::flame_dim())
+            .text_sm()
+            .text_color(SeancePalette::text())
+            .child(self.label.clone())
+    }
+}
+
+pub(super) fn status_color(state: &str) -> gpui::Hsla {
+    match state {
+        "blocked" | "risky" => SeancePalette::danger(),
+        "needs-human" => SeancePalette::violet(),
+        "done" => SeancePalette::success(),
+        "idle" => SeancePalette::text_faint(),
+        _ => SeancePalette::flame(), // planning/working
+    }
+}
+
+/// Claude Code / ink TUIs put a braille spinner in the OSC title while streaming.
+/// Idle Claude uses `✳` (U+2733) — that is *not* busy.
+///
+/// The daemon runs this same predicate over every pane and pushes the verdict
+/// (`GuiEvent::PaneBusy`); prefer `SeanceApp::busy_panes` for anything the
+/// sidebar reads. This local copy is for panes whose grid we're painting.
+pub(super) fn title_looks_busy(title: &str) -> bool {
+    seance_core::util::title_looks_busy(title)
+}
+
+/// Purple "needs you" dot: full, then dimmed, every 800ms. A slow blink, not a
+/// smooth pulse, for the same reason as the spinner: each frame is a full
+/// window render.
+pub(super) fn needs_dot_color() -> gpui::Hsla {
+    let dim = (now_ms() / 800) % 2 == 1;
+    crate::theme::SeancePalette::violet().opacity(if dim { 0.4 } else { 1.0 })
+}
+
+/// Braille spinner glyph for the sidebar workspace icon (replaces the word
+/// "working" so names get more room). Phase is wall-clock so any re-render
+/// advances the frame (terminal paint / status / pad tick).
+pub(super) fn working_spinner_glyph() -> &'static str {
+    // Classic CLI spinner frames (same family as Claude/ink titles).
+    // 240ms cadence: the animation notify forces a FULL window re-render —
+    // at 80ms that saturated the main thread on many-workspace sessions
+    // (~55ms frames × 12.5/s = pegged CPU, laggy typing).
+    const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let i = ((now_ms() / 240) as usize) % FRAMES.len();
+    FRAMES[i]
+}
+
+/// Grace window after a grid frame arrives at NEW dimensions. The PTY resize
+/// we ourselves requested makes the TUI redraw (SIGWINCH), and that redraw is
+/// a content change indistinguishable from real output — it must not reset the
+/// circle's activity clock.
+pub(super) const RESIZE_SETTLE_MS: u64 = 400;
+
+/// Does this grid frame count as real pane output for the workspace activity
+/// clock? Pure so the reflow-vs-output rule is testable without a window.
+///
+/// - first paint (no previous cells): no — attach/first-view is not output
+/// - dimension change: no — reflow, not output (and arms the settle window)
+/// - content change inside the settle window: no — that's the resize redraw
+/// - content change otherwise: yes
+pub(super) fn grid_frame_is_output(
+    prev_empty: bool,
+    dims_match: bool,
+    cells_changed: bool,
+    now_ms: u64,
+    settle_until: Option<u64>,
+) -> bool {
+    if prev_empty || !dims_match || !cells_changed {
+        return false;
+    }
+    settle_until.is_none_or(|until| now_ms >= until)
+}
+
+pub(super) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Single-quote a string for `sh -c` embedding.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// If `~/.local/share/seance/scratch/<slug>.telegram.json` exists on the
+/// DAEMON machine, post status to that topic via vita — bind read and vita
+/// call both run daemon-side over the fs bridge (agents + sidecars live
+/// there). Best-effort, fire-and-forget on a plain thread: never blocks the
+/// GUI, all failures are silently dropped.
+pub(super) fn telegram_status_bridge(
+    client: std::sync::Arc<crate::gui_client::GuiClient>,
+    slug: &str,
+    state: &str,
+    note: Option<&str>,
+) {
+    let path = super::SeanceApp::phone_bind_path(slug);
+    let text = match note {
+        Some(n) if !n.is_empty() => format!("seance `{slug}` → *{state}*: {n}"),
+        _ => format!("seance `{slug}` → *{state}*"),
+    };
+    std::thread::spawn(move || {
+        let Ok((bytes, _)) = client.fs_read_string(&path) else {
+            return;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&bytes) else {
+            return;
+        };
+        let Some(topic_id) = v.get("topic_id").and_then(|t| t.as_str()) else {
+            return;
+        };
+        let input = serde_json::json!({"topic_id": topic_id, "text": text});
+        let args = format!(
+            "capabilities call vita.telegram.send --input {}",
+            sh_quote(&input.to_string())
+        );
+        // Prefer ~/work/vita/run on the daemon box; fall back to a PATH vita.
+        let cmd = format!(
+            "if [ -x \"$HOME/work/vita/run\" ]; then cd \"$HOME/work/vita\" && ./run {args}; \
+             else vita {args}; fi >/dev/null 2>&1"
+        );
+        let _ = client.shell(&cmd);
+    });
+}
+
+/// True when the chrome-chord modifier is down: ctrl anywhere, plus cmd on
+/// macOS. `mac` is `cfg!(target_os = "macos")` at the call site so both arms
+/// stay testable from one machine.
+///
+/// Cmd is free to claim: `remote_term_view` already swallows every cmd combo
+/// on macOS (it's the copy/paste chord there), so no TUI loses a key. Linux is
+/// excluded on purpose — `platform` is super there, and super+<key> is the
+/// window manager's.
+pub(super) fn chord_modifier_held(mods: &gpui::Modifiers, mac: bool) -> bool {
+    mods.control || (mac && mods.platform)
+}
+
+/// A mac keyboard has no page keys, so with cmd held the up/down arrows stand
+/// in for them and the circle / pane cycles stay reachable. Cmd-only on
+/// purpose: `ctrl+shift+arrows` is spatial pane nav and bare `ctrl+arrows` is a
+/// PTY sequence, so neither is available to borrow.
+pub(super) fn arrow_stands_in_for_page(key: &str, mods: &gpui::Modifiers, mac: bool) -> bool {
+    mac && mods.platform && !mods.control && matches!(key, "up" | "arrowup" | "down" | "arrowdown")
+}
+
+/// `ctrl+shift+<N>` → 0-based rail row. Accepts the digit *and* the US-layout
+/// shifted symbol: the compositor reports one or the other depending on how it
+/// resolves the shift, and a chord that works on one machine and silently does
+/// nothing on the next is worse than no chord.
+pub(super) fn rail_index_for_key(key: &str) -> Option<usize> {
+    let digit = match key {
+        "1" | "!" => 1,
+        "2" | "@" => 2,
+        "3" | "#" => 3,
+        "4" | "$" => 4,
+        "5" | "%" => 5,
+        "6" | "^" => 6,
+        "7" | "&" => 7,
+        "8" | "*" => 8,
+        "9" | "(" => 9,
+        _ => return None,
+    };
+    Some(digit - 1)
+}
+
+/// A pane's right-click menu: mark it unread to come back to (an "Unread"
+/// chip on Stage and a dot on its row until you open it), or clear that.
+/// `rename` only where the rename field will show: a classic rail row can
+/// list a pane with no tile to hold it.
+pub(super) fn pane_menu(
+    menu: gpui_component::menu::PopupMenu,
+    slug: &str,
+    marked: bool,
+    rename: bool,
+) -> gpui_component::menu::PopupMenu {
+    let (label, on) = if marked {
+        ("mark read", false)
+    } else {
+        ("mark unread", true)
+    };
+    let menu = if rename {
+        menu.menu(
+            "rename",
+            Box::new(super::actions::ActRenamePane(slug.to_string())),
+        )
+    } else {
+        menu
+    };
+    menu.menu(
+        label,
+        Box::new(super::actions::ActMarkUnread(slug.to_string(), on)),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hsla has no PartialEq — compare component floats exactly (palette
+    /// consts are fixed literals, so bit-equality is fine).
+    fn same_color(a: gpui::Hsla, b: gpui::Hsla) -> bool {
+        a.h == b.h && a.s == b.s && a.l == b.l && a.a == b.a
+    }
+
+    /// Selecting a circle must never bump its last-active time. The first
+    /// select lays out its tiles → PTY resize → SIGWINCH redraw; that redraw
+    /// is a content change, and treating it as output is what made a circle
+    /// jump to the top the first time it was clicked in a GUI session.
+    #[test]
+    fn grid_frame_is_output_ignores_first_paint_and_reflow() {
+        let t = 10_000;
+        // First frame for a pane (attach / first view): never output.
+        assert!(!grid_frame_is_output(true, true, true, t, None));
+        // Dimension change: reflow, not output.
+        assert!(!grid_frame_is_output(false, false, true, t, None));
+        // Redraw inside the settle window the reflow armed.
+        assert!(!grid_frame_is_output(
+            false,
+            true,
+            true,
+            t,
+            Some(t + RESIZE_SETTLE_MS)
+        ));
+        // Identical cells are never output.
+        assert!(!grid_frame_is_output(false, true, false, t, None));
+    }
+
+    #[test]
+    fn grid_frame_is_output_accepts_real_output() {
+        let t = 10_000;
+        assert!(grid_frame_is_output(false, true, true, t, None));
+        // Settle window has expired — this is genuine output again.
+        assert!(grid_frame_is_output(false, true, true, t, Some(t - 1)));
+        assert!(grid_frame_is_output(false, true, true, t, Some(t)));
+    }
+
+    #[test]
+    fn title_looks_busy_detects_braille_spinner() {
+        // Claude/ink stream a braille spinner (U+2800..=U+28FF) in the title.
+        assert!(title_looks_busy("\u{2800} building"));
+        assert!(title_looks_busy("\u{28FF} working"));
+        assert!(title_looks_busy("\u{2809} running tests"));
+        // Leading whitespace is trimmed before the spinner check.
+        assert!(title_looks_busy("   \u{2807} thinking"));
+    }
+
+    #[test]
+    fn title_looks_busy_idle_and_empty() {
+        // Idle Claude uses ✳ (U+2733) — explicitly NOT busy.
+        assert!(!title_looks_busy("\u{2733} idle"));
+        // Plain text titles.
+        assert!(!title_looks_busy("bash"));
+        assert!(!title_looks_busy("vim src/main.rs"));
+        // Empty / whitespace-only.
+        assert!(!title_looks_busy(""));
+        assert!(!title_looks_busy("   "));
+    }
+
+    #[test]
+    fn status_color_maps_variants_distinctly() {
+        let blocked = status_color("blocked");
+        let risky = status_color("risky");
+        let needs_human = status_color("needs-human");
+        let done = status_color("done");
+        let idle = status_color("idle");
+        let unknown = status_color("planning-or-anything-else");
+
+        // Documented pairings.
+        assert!(same_color(blocked, SeancePalette::danger()));
+        assert!(same_color(risky, SeancePalette::danger()));
+        assert!(same_color(needs_human, SeancePalette::violet()));
+        assert!(same_color(done, SeancePalette::success()));
+        assert!(same_color(idle, SeancePalette::text_faint()));
+        // Fallback: unknown → flame (planning/working).
+        assert!(same_color(unknown, SeancePalette::flame()));
+
+        // Distinct families map to distinct colors.
+        assert!(!same_color(blocked, needs_human));
+        assert!(!same_color(needs_human, done));
+        assert!(!same_color(done, idle));
+        assert!(!same_color(idle, unknown));
+        // blocked/risky share danger by design.
+        assert!(same_color(blocked, risky));
+    }
+
+    #[test]
+    fn sh_quote_escapes_single_quotes() {
+        assert_eq!(sh_quote("plain"), "'plain'");
+        assert_eq!(sh_quote("a'b"), r"'a'\''b'");
+        // JSON payloads (double quotes) ride through untouched inside 's.
+        assert_eq!(sh_quote(r#"{"k":"v"}"#), r#"'{"k":"v"}'"#);
+    }
+
+    #[test]
+    fn now_ms_is_monotonic_nonzero() {
+        let a = now_ms();
+        let b = now_ms();
+        assert!(a > 0);
+        assert!(b >= a);
+    }
+
+    #[test]
+    fn rail_digits_map_from_one_to_zero_indexed() {
+        assert_eq!(rail_index_for_key("1"), Some(0));
+        assert_eq!(rail_index_for_key("9"), Some(8));
+    }
+
+    #[test]
+    fn a_shifted_digit_is_the_same_row() {
+        // Compositors differ on whether ctrl+shift+1 arrives as "1" or "!".
+        for (digit, sym) in [
+            ("1", "!"),
+            ("2", "@"),
+            ("3", "#"),
+            ("4", "$"),
+            ("5", "%"),
+            ("6", "^"),
+            ("7", "&"),
+            ("8", "*"),
+            ("9", "("),
+        ] {
+            assert_eq!(
+                rail_index_for_key(digit),
+                rail_index_for_key(sym),
+                "{digit}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_and_letters_are_not_rail_rows() {
+        // 0 would be row -1; the rail is 1-indexed to the human.
+        assert_eq!(rail_index_for_key("0"), None);
+        assert_eq!(rail_index_for_key(")"), None);
+        assert_eq!(rail_index_for_key("k"), None);
+    }
+
+    fn mods(control: bool, platform: bool) -> gpui::Modifiers {
+        gpui::Modifiers {
+            control,
+            platform,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ctrl_is_the_chord_modifier_on_every_platform() {
+        assert!(chord_modifier_held(&mods(true, false), true));
+        assert!(chord_modifier_held(&mods(true, false), false));
+    }
+
+    #[test]
+    fn cmd_joins_it_only_on_macos() {
+        // Same physical key: cmd on a mac, super on linux. Super belongs to
+        // the window manager, so only the mac arm claims it.
+        assert!(chord_modifier_held(&mods(false, true), true));
+        assert!(!chord_modifier_held(&mods(false, true), false));
+    }
+
+    #[test]
+    fn a_bare_key_is_never_a_chord() {
+        assert!(!chord_modifier_held(&mods(false, false), true));
+        assert!(!chord_modifier_held(&mods(false, false), false));
+    }
+
+    #[test]
+    fn cmd_arrows_are_page_keys_on_a_mac() {
+        for k in ["up", "arrowup", "down", "arrowdown"] {
+            assert!(arrow_stands_in_for_page(k, &mods(false, true), true), "{k}");
+        }
+    }
+
+    #[test]
+    fn ctrl_arrows_are_left_alone() {
+        // ctrl+shift+arrows is spatial pane nav and bare ctrl+arrows is a PTY
+        // sequence — borrowing either would cost a key that already works.
+        assert!(!arrow_stands_in_for_page("up", &mods(true, false), true));
+        assert!(!arrow_stands_in_for_page("up", &mods(true, true), true));
+    }
+
+    #[test]
+    fn the_stand_in_is_macos_only_and_arrows_only() {
+        // Linux has page keys and a window manager that owns super.
+        assert!(!arrow_stands_in_for_page("up", &mods(false, true), false));
+        assert!(!arrow_stands_in_for_page("left", &mods(false, true), true));
+        assert!(!arrow_stands_in_for_page("k", &mods(false, true), true));
+    }
+}
